@@ -1,0 +1,143 @@
+
+# 針對 Threads 的雜訊字符 (ASCII / 短字串)
+noisy_ascii:
+  - "http"
+  - "https"
+  - "com"
+  - "www"
+  - "igshid"
+  - "jpg"
+  - "png"
+  - "bot"
+  - "thread"
+  - "threads"
+  - "scontent"
+  - "cdninstagram"
+  - "translated"
+  - "google"
+  - "translate"
+
+# 包含這些關鍵詞的行，整行丟棄
+drop_patterns:
+  - "查看更多"
+  - "翻譯年糕"
+  - "顯示更多"
+  - "回覆"
+  - "轉發"
+  - "引用"
+  - "檢舉"
+  - "隱藏"
+  - "封鎖"
+  - "限制"
+  - "關於"
+  - "使用條款"
+  - "隱私權政策"
+  - "Cookie"
+  - "Meta"
+  - "Instagram"
+  - "登入"
+  - "註冊"
+  - "追蹤"
+  - "粉絲"
+
+# 忽略的特定Token (新增)
+ignore_tokens:
+  - "劇透"
+  - "查看更多"
+  - "開啟"
+  - "顯示"
+  - "更多"
+  - "內容"
+  - "翻譯"
+
+# 詞性過濾 (新增)
+# n: 名詞, v: 動詞, nr: 人名, ns: 地名, nt: 機構名, nz: 其他專名, vn: 動名詞
+pos_filters:
+  - "n"
+  - "v"
+  - "nr"
+  - "ns"
+  - "nt"
+  - "nz"
+  - "vn"
+
+# 必須強制丟棄的促銷/無意義字 (regex)
+promo_ascii:
+  - '^\d+[\w]*$'   # 純數字或數字開頭
+  - '^[a-f0-9]{10,}$' # 長亂碼
+  - '^[0-9]+(m|k)$'  # 10k, 5m
+
+# 詞組探勘時，若包含這些 regex 就丟棄
+phrase_drop_regex:
+  - '^\d+'
+  - '^[a-zA-Z\W]+$'  # 純英文或符號
+
+# 高精準度停用詞 (額外補充)
+precision_stopwords:
+  - "真的"
+  - "覺得"
+  - "比較"
+  - "可能"
+  - "其實"
+  - "只是"
+  - "可以"
+  - "就是"
+  - "大家"
+  - "知道"
+  - "看到"
+  - "還有"
+  - "現在"
+  - "時候"
+  - "東西"
+  - "很多"
+  - "一定"
+  - "一下"
+  - "一點"
+  - "一直"
+  - "因為"
+  - "所以"
+  - "然後"
+  - "而且"
+  - "但是"
+  - "如果"
+  - "雖然"
+  - "不過"
+  - "那麼"
+  - "這麼"
+  - "哪些"
+
+# 英文白名單 (特定要留下的英文詞)
+# 如果判定 function 覺得是 ASCII，但它在這個 list 裡，就放行
+meaningful_ascii_keep:
+  - "ai"
+  - "app"
+  - "ios"
+  - "android"
+  - "google"
+  - "meta"
+  - "line"
+  - "ig"
+  - "threads"
+  - "fb"
+  - "youtube"
+  - "netflix"
+  - "spotify"
+  - "apple"
+  - "mac"
+  - "iphone"
+  - "ipad"
+  - "pc"
+  - "windows"
+  - "python"
+  - "javascript"
+  - "html"
+  - "css"
+  - "sql"
+  - "api"
+  - "bot"
+  - "chatgpt"
+  - "llm"
+  - "gpu"
+  - "cpu"
+  - "ram"
+  - "ssd"

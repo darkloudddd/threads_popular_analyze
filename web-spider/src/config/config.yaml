@@ -1,0 +1,52 @@
+urls:
+  login: "https://www.threads.net/login"
+  start: "https://www.threads.net/"
+
+selectors:
+  post_priority:
+    - "article"
+    - "div[role='article']"
+    - "[data-testid='post']"
+  post_container: "div[data-pressable-container='true']"
+  strip: "button, [role='button'], svg, path, time, header, footer"
+
+filtering:
+  min_block_chars: 10
+  noise_lines:
+    - "follow"
+    - "following"
+    - "like"
+    - "likes"
+    - "reply"
+    - "replies"
+    - "repost"
+    - "reposts"
+    - "share"
+    - "shares"
+    - "more"
+    - "translate"
+    - "see translation"
+    - "see original"
+    - "為你推薦"
+    - "追蹤中"
+    - "首頁"
+    - "搜尋"
+    - "通知"
+    - "個人檔案"
+    - "更多"
+    - "建立"
+    - "追蹤"
+  noise_patterns:
+    - "^\\d+(\\.\\d+)?[km]?$"
+    - "^\\d+\\s*(likes?|replies?|reposts?|shares?)$"
+    - "^\\d+\\s*/\\s*\\d+$"
+    - "^\\u5728\\s*\\d+\\s*(?:\\u5206\\u9418|\\u5c0f\\u6642|\\u5929)\\u524d(?:\\u8f49\\u767c)?$"
+    - "^.*\\u64ad\\u653e\\u6b64\\u5f71\\u7247.*\\u554f\\u984c.*$"
+    - "^(?:\\u77ad\\u89e3|\\u4e86\\u89e3)\\u8a73\\u60c5$"
+
+settings:
+  scroll_pause_time: 1.0
+  max_scrolls: 500
+  viewport:
+    width: 1200
+    height: 900

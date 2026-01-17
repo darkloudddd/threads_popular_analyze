@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+
+# Data & Results
+*.csv
+*.txt
+!requirements.txt
+!test_input.txt
+result.txt
+web-spider/result.txt
+web-spider/user_data/
+web-spider/src/user_data/
+web-spider/logs/
+web-spider/debug_html/
+word_tfidf.txt
+
+# Editor
+.vscode/
+.idea/
