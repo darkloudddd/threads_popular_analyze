@@ -2,22 +2,27 @@
 __pycache__/
 *.py[cod]
 *$py.class
+venv/
+env/
 .venv/
-.env
 
-# Data & Results
-*.csv
-*.txt
-!requirements.txt
-!test_input.txt
-result.txt
+# Data
 web-spider/result.txt
+result.txt
+outputs/
+web-spider/debug_html/
 web-spider/user_data/
 web-spider/src/user_data/
-web-spider/logs/
-web-spider/debug_html/
-word_tfidf.txt
+web-spider/src/debug_html/
 
-# Editor
+# Config/Secrets (if any)
+.env
+
+# System
+.DS_Store
+Thumbs.db
+
+# IDE
 .vscode/
 .idea/
+.gemini/

@@ -1,0 +1,14 @@
+# Core
+jieba >= 0.42.1
+pandas >= 1.3.0
+pyyaml >= 6.0
+playwright >= 1.40.0
+
+# High Precision NLP (Optional)
+ckip-transformers >= 0.3.4
+transformers >= 4.30.0
+# For CPU version:
+# torch >= 2.0.0
+# For GPU (CUDA) version, use the following instead:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+torch >= 2.0.0

@@ -24,10 +24,41 @@ try:
 except Exception:
     pd = None
 
+# --- CKIP deps (optional) ---
+try:
+    from ckip_transformers.nlp import CkipWordSegmenter, CkipPosTagger, CkipNerChunker
+    CKIP_OK = True
+except Exception:
+    CKIP_OK = False
+
 # POS 保留：名詞/專有名詞/地名/機構名/動名詞等
 POS_KEEP_PREFIX = ("n", "nr", "ns", "nt", "nz", "vn")
+# POS 加權：專有名詞、地名、機構名加權，提升趨勢感
+POS_WEIGHTS = {
+    "nz": 1.5,  # 其他專名
+    "nt": 1.5,  # 機構名
+    "ns": 1.3,  # 地名
+    "nr": 1.2,  # 人名
+}
 
 USERNAME_TOKEN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._]{1,28}[a-z0-9])?$", re.IGNORECASE)
+
+# --- 注音文 / 台灣口語轉換表 ---
+ZHUYIN_MAP = {
+    "ㄉ": "的", "ㄅ": "吧", "ㄇ": "嗎", "ㄋ": "呢",
+    "ㄌ": "了", "ㄛ": "喔", "ㄟ": "欸", "ㄏ": "呵",
+    "ㄆ": "噗", "ㄎ": "可",
+}
+_ZHUYIN_RE = re.compile("(" + "|".join(re.escape(k) for k in ZHUYIN_MAP) + ")")
+
+def normalize_taiwanese_text(text: str) -> str:
+    """Convert common zhuyin abbreviations and normalize spaces as punctuation."""
+    # 1. 注音文轉換 (ㄉ -> 的, ㄅ -> 吧, ...)
+    text = _ZHUYIN_RE.sub(lambda m: ZHUYIN_MAP[m.group()], text)
+    # 2. 台灣用戶常以空白取代標點 — 將連續空白轉為全形逗號幫助 jieba 斷句
+    #    但只在「中文字 空白 中文字」的情境下做替換，避免破壞英文
+    text = re.sub(r'(?<=[\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])', '，', text)
+    return text
 
 # --------------------------
 # Helpers
@@ -75,6 +106,56 @@ def load_analysis_config(config_path):
         print(f"[ERROR] Failed to load analysis config: {e}")
         
     return analysis_config
+
+
+class CKIPAnalyzer:
+    """
+    Wrapper for CKIP Transformers models.
+    Lazily loads models to save memory if not used.
+    """
+    def __init__(self, level=1, device=-1):
+        """
+        level: 1 (albert-tiny), 2 (albert-base), 3 (bert-base)
+        device: -1 for CPU, 0+ for GPU
+        """
+        self.level = level
+        self.device = device
+        self.ws_driver = None
+        self.pos_driver = None
+        self.ner_driver = None
+
+    def _load(self):
+        # Map level to model name
+        model_map = {
+            1: "albert-tiny",
+            2: "albert-base",
+            3: "bert-base"
+        }
+        model_name = model_map.get(self.level, "albert-tiny")
+
+        if self.ws_driver is None:
+            print(f"[INFO] Loading CKIP WordSegmenter (model: {model_name}, device: {self.device})...")
+            self.ws_driver = CkipWordSegmenter(model=model_name, device=self.device)
+        if self.pos_driver is None:
+            print(f"[INFO] Loading CKIP PosTagger (model: {model_name})...")
+            self.pos_driver = CkipPosTagger(model=model_name, device=self.device)
+        if self.ner_driver is None:
+            print(f"[INFO] Loading CKIP NerChunker (model: {model_name})...")
+            self.ner_driver = CkipNerChunker(model=model_name, device=self.device)
+
+    def analyze(self, posts):
+        """
+        Batch analyze posts.
+        Returns: list of (words, pos, ner) per post
+        """
+        self._load()
+        print(f"[INFO] CKIP Analyzing {len(posts)} posts...")
+        # CKIP batch processing
+        ws_results = self.ws_driver(posts)
+        pos_results = self.pos_driver(ws_results)
+        ner_results = self.ner_driver(posts) # NER takes raw text list
+        
+        return list(zip(ws_results, pos_results, ner_results))
 
 
 def _render_progress(label, idx, total, start_time):
@@ -156,7 +237,38 @@ def clean_text(text):
         text = re.sub(r"[\U00010000-\U0010ffff]", " ", text)
     except re.error:
         pass
+    # 台灣文本正規化 (注音文轉換 + 空白轉標點)
+    text = normalize_taiwanese_text(text)
     text = re.sub(r"[ \t]+", " ", text)
+    return text
+
+
+def strip_threads_metadata(text: str) -> str:
+    """
+    Remove Threads UI artefacts that get captured by the crawler:
+    - Time prefix: '5小時', '23分鐘', '1天', '2天'
+    - '第一則串文' prefix
+    - Trailing engagement metrics: '1,411 47 13 21', '2.5 萬 211 1,234'
+    - Merged/doubled numbers from dynamic UI: '502503'
+    - '劇透' tag spam
+    - '翻譯' / 'AI 資訊' suffix
+    - Countdown timer: '還剩N小時'
+    """
+    # 1. 移除開頭的 '第一則串文'
+    text = re.sub(r'^第一則串文\s*', '', text)
+    # 2. 移除開頭的時間前綴 (5小時, 23分鐘, 1天, 22小時)
+    text = re.sub(r'^\d+\s*(小時|分鐘|天)\s*', '', text)
+    # 3. 移除末尾 '還剩N小時' 之類的倒計時
+    text = re.sub(r'\s*還剩\d+小時\s*$', '', text)
+    # 4. 移除末尾的 '翻譯' / 'AI 資訊'
+    text = re.sub(r'\s*(翻譯|AI\s*資訊)\s*$', '', text)
+    # 5. 移除尾部的互動數字 (likes, comments, shares, reposts)
+    #    常見格式: '1,411 47 13 21' 或 '2.5 萬 211 1,234 6,381'
+    #    也有合併格式: '502503 16 1 16'
+    text = re.sub(r'\s+[\d,.]+(\s*萬)?(?:\s+[\d,.]+(?:\s*萬)?){1,5}\s*$', '', text)
+    # 6. 移除重複的 '劇透' (保留第一個)
+    text = re.sub(r'(劇透\s*){2,}', '劇透 ', text)
+    text = text.strip()
     return text
 
 
@@ -312,9 +424,10 @@ def ngrams(seq, n):
         yield tuple(seq[i:i+n])
 
 
-def extract_keywords_with_pos(posts, top_n=30, stopwords=None, ignore_tokens=None, pos_filters=None):
+def extract_keywords_with_pos(posts, top_n=30, stopwords=None, ignore_tokens=None, pos_filters=None, ckip_results=None):
     """
-    Use TF-IDF to find top keywords, but with POS filtering.
+    Use TF-IDF to find top keywords, but with POS filtering and weighting.
+    ckip_results: if provided, use pre-tokenized (ws, pos, ner) instead of jieba.
     """
     if stopwords is None:
         stopwords = set()
@@ -323,74 +436,196 @@ def extract_keywords_with_pos(posts, top_n=30, stopwords=None, ignore_tokens=Non
     if pos_filters is None:
         pos_filters = []  # Empty means no filtering
         
-    # Build a custom IDF based on our corpus
-    # term -> doc_count
     doc_freq = Counter()
     total_docs = len(posts)
+    post_tokens_list = [] # List of lists of (word, flag)
     
-    # We will tokenize each post once
-    post_tokens_list = []
-    
-    for p in posts:
-        # Use pseg for POS tagging
-        words = pseg.cut(p)
-        unique_tokens = set()
-        
-        tokens_for_this_post = []
-        
-        for w, flag in words:
-            w = w.strip().lower()
-            if len(w) < 2 and w not in ["ai", "ui", "ux"]: 
-                # Keep some short meaningful English words, otherwise drop single chars
-                if not re.match(r'^[a-zA-Z0-9]+$', w): 
+    if ckip_results:
+        # Use CKIP tokens
+        for ws, pos, ner in ckip_results:
+            unique_tokens = set()
+            tokens_for_this_post = []
+            for w, flag in zip(ws, pos):
+                w = w.strip().lower()
+                if not w or w in stopwords or w in ignore_tokens:
                     continue
-
-            if w in stopwords:
-                continue
-            if w in ignore_tokens:
-                continue
-            
-            # POS Filtering
-            # jieba POS tags: n (noun), v (verb), a (adj), etc.
-            # detailed: nr (person), ns (place), nt (org), nz (other proper noun)
-            if pos_filters:
-                # Check if flag starts with any allowed prefix
-                # e.g. 'n' matches 'n', 'nr', 'ns'...
-                matched_pos = False
-                for pf in pos_filters:
-                    if flag.startswith(pf):
-                        matched_pos = True
-                        break
-                if not matched_pos:
+                if len(w) < 2 and not re.match(r'^[a-zA-Z0-9]+$', w):
                     continue
+                
+                # CKIP flags are uppercase and more detailed, but we check prefix
+                if pos_filters:
+                    matched_pos = False
+                    f_low = flag.lower()
+                    for pf in pos_filters:
+                        if f_low.startswith(pf):
+                            matched_pos = True
+                            break
+                    if not matched_pos:
+                        continue
+                
+                unique_tokens.add(w)
+                tokens_for_this_post.append((w, flag.lower()))
+            for t in unique_tokens:
+                doc_freq[t] += 1
+            post_tokens_list.append(tokens_for_this_post)
+    else:
+        # Use Jieba/Pseg
+        for p in posts:
+            words = pseg.cut(p) if pseg else []
+            unique_tokens = set()
+            tokens_for_this_post = []
             
-            unique_tokens.add(w)
-            tokens_for_this_post.append(w)
-            
-        for t in unique_tokens:
-            doc_freq[t] += 1
-            
-        post_tokens_list.append(tokens_for_this_post)
+            for w, flag in words:
+                w = w.strip().lower()
+                if len(w) < 2 and w not in ["ai", "ui", "ux"]: 
+                    if not re.match(r'^[a-zA-Z0-9]+$', w): 
+                        continue
 
-    # Calculate TF-IDF
-    # TF = count in corpus? Or avg tf? 
-    # Standard approach for "top keywords in corpus":
-    # 1. Calculate TF for the *entire concatenated corpus*
-    # 2. Use IDF from the corpus document frequency
-    
+                if w in stopwords or w in ignore_tokens:
+                    continue
+                
+                if pos_filters:
+                    matched_pos = False
+                    for pf in pos_filters:
+                        if flag.startswith(pf):
+                            matched_pos = True
+                            break
+                    if not matched_pos:
+                        continue
+                
+                unique_tokens.add(w)
+                tokens_for_this_post.append((w, flag))
+                
+            for t in unique_tokens:
+                doc_freq[t] += 1
+            post_tokens_list.append(tokens_for_this_post)
+
+    # Calculate TF-IDF with POS Weighting
     total_term_freq = Counter()
-    for tokens in post_tokens_list:
-        total_term_freq.update(tokens)
+    term_pos_map = {} # Cache POS for weighting (use most frequent flag for word)
+    
+    for tokens_info in post_tokens_list:
+        for w, flag in tokens_info:
+            total_term_freq[w] += 1
+            if w not in term_pos_map:
+                term_pos_map[w] = flag
         
     tfidf_scores = {}
     for term, count in total_term_freq.items():
         tf = count
         df = doc_freq[term]
         idf = math.log(total_docs / (df + 1))
-        tfidf_scores[term] = tf * idf
+        
+        # Apply POS Weighting
+        weight = 1.0
+        flag = term_pos_map.get(term, "n")
+        for p_pref, p_weight in POS_WEIGHTS.items():
+            if flag.startswith(p_pref):
+                weight = max(weight, p_weight)
+                break
+        
+        tfidf_scores[term] = tf * idf * weight
         
     sorted_words = sorted(tfidf_scores.items(), key=lambda x: x[1], reverse=True)
     return sorted_words[:top_n]
+
+
+def generate_trend_report(keywords, phrases, hashtags, ckip_results=None):
+    """
+    Generate a categorized summary of trends for the user.
+    Safe for Windows terminals (avoiding emoji encoding issues).
+    """
+    header = "\n" + "="*50 + "\nTHREADS 流行趨勢洞察簡報 (Trend Insight Report)\n" + "="*50
+    try:
+        print(header)
+    except UnicodeEncodeError:
+        print(header.encode('ascii', errors='replace').decode('ascii'))
+
+    # Categories
+    people_media = []
+    places = []
+    food_lifestyle = []
+    events_items = []
+    
+    # Food/Lifestyle keywords to help categorization
+    FOOD_KEYWORDS = {"甜點", "咖啡", "草莓", "蛋糕", "火鍋", "宵夜", "美食", "早午餐", "餐廳", "隱藏"}
+    
+    # Process keywords and phrases
+    seen = set()
+    
+    # 1. Use CKIP NER results if available for high-precision tagging
+    if ckip_results:
+        # ner: list of list of NerToken(word, ner, start, end)
+        entity_freq = Counter()
+        for doc_ws, doc_pos, doc_ner in ckip_results:
+            for ent in doc_ner:
+                entity_freq[(ent.word, ent.ner)] += 1
+        
+        # Sort entities by frequency
+        sorted_entities = sorted(entity_freq.items(), key=lambda x: x[1], reverse=True)
+        for (word, etype), count in sorted_entities:
+            if word in seen or len(word) < 2 or word in FOOD_KEYWORDS:
+                continue
+            
+            if etype in ["PERSON", "WORK_OF_ART"]:
+                people_media.append(f"[NER:{etype}] {word}")
+                seen.add(word)
+            elif etype in ["GPE", "LOC", "FAC"]:
+                places.append(f"[NER:{etype}] {word}")
+                seen.add(word)
+            elif etype in ["PRODUCT", "ORG", "EVENT"]:
+                events_items.append(f"[NER:{etype}] {word}")
+                seen.add(word)
+
+    # 2. Process phrases (Bigrams / Trigrams)
+    for item in phrases[:15]: # Take top phrases
+        p = item[0]
+        if p in seen: continue
+        if any(f in p for f in FOOD_KEYWORDS):
+            food_lifestyle.append(f"[Food]  {p}")
+        elif any(k in p for k in ["演出", "合唱", "電影", "進擊", "巨人", "角色", "演員", "歌手"]):
+            people_media.append(f"[Media] {p}")
+        else:
+            events_items.append(f"[Event] {p}")
+        seen.add(p)
+
+    # 3. Process remaining Keywords
+    for word, score in keywords[:60]:
+        if word in seen: continue
+        # Manual tagging helper (simplified)
+        if any(f in word for f in FOOD_KEYWORDS):
+            food_lifestyle.append(f"[Food]  {word}")
+        elif any(k in word for k in ["台南", "台北", "日本", "台中", "高雄", "花蓮", "旅遊", "咖啡廳"]):
+            places.append(f"[Place] {word}")
+        elif len(word) >= 2:
+            events_items.append(f"[Trend] {word}")
+
+    def safe_print(msg):
+        try:
+            print(msg)
+        except UnicodeEncodeError:
+            # Fallback for Windows CP950
+            print(msg.encode(sys.stdout.encoding, errors='replace').decode(sys.stdout.encoding))
+
+    safe_print("\n[人物與影視娛樂]")
+    for item in people_media[:8]: safe_print(f"  - {item}")
+    
+    safe_print("\n[熱門地點與旅遊]")
+    for item in places[:8]: safe_print(f"  - {item}")
+    
+    safe_print("\n[美食、甜點與生活]")
+    for item in food_lifestyle[:8]: safe_print(f"  - {item}")
+    
+    safe_print("\n[熱門商品、事件與話題]")
+    for item in events_items[:12]: safe_print(f"  - {item}")
+
+    if hashtags:
+        safe_print("\n[熱門 Hashtags]")
+        tag_list = sorted(hashtags.items(), key=lambda x: x[1], reverse=True)
+        tags_line = "  " + " ".join([h for h, count in tag_list[:6]])
+        safe_print(tags_line)
+    
+    safe_print("\n" + "="*50)
 
 
 def compute_tfidf(all_docs_tokens):
@@ -542,15 +777,27 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
                  out_phrase_csv="phrase_freq.csv", out_hashtag_csv="hashtag_freq.csv",
                  debug=False, user_dict_path=None, min_doc_tokens=3, min_chinese_ratio=0.2,
                  precision=False, progress=True, dedupe=True, dedupe_hamming=3,
-                 config_path=None, default_stopwords_path=None):
+                 config_path=None, default_stopwords_path=None,
+                 engine="jieba", ckip_level=1, device=-1):
     if not os.path.exists(path):
         raise FileNotFoundError(f"input file not found: {path}")
 
-    if JIEBA_OK and user_dict_path and os.path.exists(user_dict_path):
-        try:
-            jieba.load_userdict(user_dict_path)
-        except Exception:
-            pass
+    if JIEBA_OK:
+        # 自動載入台灣流行語字典 (如果存在)
+        tw_slang_path = os.path.join(os.path.dirname(os.path.abspath(path)), "config", "tw_slang.txt")
+        if not os.path.exists(tw_slang_path):
+            tw_slang_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "tw_slang.txt")
+        if os.path.exists(tw_slang_path):
+            try:
+                jieba.load_userdict(tw_slang_path)
+            except Exception:
+                pass
+        # 載入使用者自訂字典
+        if user_dict_path and os.path.exists(user_dict_path):
+            try:
+                jieba.load_userdict(user_dict_path)
+            except Exception:
+                pass
 
     # Load Config
     config = load_analysis_config(config_path) if config_path else {}
@@ -569,6 +816,9 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
 
     raw = clean_text(raw)
     posts = split_posts(raw, drop_patterns=drop_patterns)
+    # Strip Threads UI artefacts (time prefix, engagement numbers, etc.)
+    posts = [strip_threads_metadata(p) for p in posts]
+    posts = [p for p in posts if p]
     stopwords = load_stopwords(stopwords_path, default_stopwords_path, noisy_ascii)
 
     if precision:
@@ -603,27 +853,54 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
     dup_exact = 0
     dup_near = 0
 
-    for p in iter_with_progress(filtered_posts, label="tokenizing", enable=progress):
-        norm = normalize_text_for_dedupe(p)
-        if norm in seen_norm:
-            dup_exact += 1
-            continue
-        seen_norm.add(norm)
-        toks = tokenize_post(p, keep_hash_at=keep_hash_at, pos_only=pos_only, stopwords=stopwords, min_len=min_len)
-        toks = [t for t in toks if t not in noisy_ascii and not re.fullmatch(r"[a-z]{2,3}\d*", t)]
-        if keep_hash_at:
-            toks = [t for t in toks if not looks_like_username(t) or t.startswith("@")]
+    # --- ENGINE-SPECIFIC TOKENIZATION ---
+    ckip_results = None
+    if engine.lower() == "ckip":
+        if not CKIP_OK:
+            print("[WARN] ckip-transformers not installed. Falling back to jieba.")
         else:
-            toks = [t for t in toks if not looks_like_username(t)]
-        if len(toks) >= min_doc_tokens:
-            if dedupe:
-                sig = simhash(toks)
-                if is_near_duplicate(sig, simhash_buckets, threshold=dedupe_hamming):
-                    dup_near += 1
-                    continue
-            docs_tokens.append(toks)
-            for tag in re.findall(r"#[\w\u4e00-\u9fff]+", p):
-                hashtags[tag.lower()] += 1
+            analyzer = CKIPAnalyzer(level=ckip_level, device=device)
+            # Batch process filtered posts
+            ckip_results = analyzer.analyze(filtered_posts)
+            
+            # Fill docs_tokens for compatible processing (tfidf, etc.)
+            for i, (ws, pos, ner) in enumerate(ckip_results):
+                toks = []
+                for w, flag in zip(ws, pos):
+                    w = w.strip().lower()
+                    if len(w) >= min_len and w not in stopwords:
+                        toks.append(w)
+                docs_tokens.append(toks)
+                # Hashtag extraction
+                for tag in re.findall(r"#[\w\u4e00-\u9fff]+", filtered_posts[i]):
+                    hashtags[tag.lower()] += 1
+
+    if not ckip_results:
+        # Fallback/Default Jieba behavior
+        for p in iter_with_progress(filtered_posts, label="tokenizing", enable=progress):
+            norm = normalize_text_for_dedupe(p)
+            if norm in seen_norm:
+                dup_exact += 1
+                continue
+            seen_norm.add(norm)
+            
+            toks = tokenize_post(p, keep_hash_at=keep_hash_at, pos_only=pos_only, stopwords=stopwords, min_len=min_len)
+            # 額外過濾垃圾
+            toks = [t for t in toks if t not in noisy_ascii and not re.fullmatch(r"[a-z]{2,3}\d*", t)]
+            if keep_hash_at:
+                toks = [t for t in toks if not looks_like_username(t) or t.startswith("@")]
+            else:
+                toks = [t for t in toks if not looks_like_username(t)]
+            
+            if len(toks) >= min_doc_tokens:
+                if dedupe:
+                    sig = simhash(toks)
+                    if is_near_duplicate(sig, simhash_buckets, threshold=dedupe_hamming):
+                        dup_near += 1
+                        continue
+                docs_tokens.append(toks)
+                for tag in re.findall(r"#[\w\u4e00-\u9fff]+", p):
+                    hashtags[tag.lower()] += 1
 
     if debug:
         total_tokens = sum(len(t) for t in docs_tokens)
@@ -643,11 +920,12 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
 
     # 4. Keyword Analysis (TF-IDF with POS filtering)
     top_keywords = extract_keywords_with_pos(
-        posts, 
+        filtered_posts, 
         top_n=topn, 
         stopwords=stopwords,
         ignore_tokens=config.get("ignore_tokens"),
-        pos_filters=list(config.get("pos_filters", []))
+        pos_filters=list(config.get("pos_filters", [])),
+        ckip_results=ckip_results
     )
     
 
@@ -695,22 +973,11 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
                 for h, c in sorted(hashtags.items(), key=lambda x: x[1], reverse=True):
                     f.write(f"{h},{c}\n")
 
-    # ---- 終端列印 ----
-    print(f"Top {topn} words by TF-IDF:")
-    for w, s in top_keywords[:topn]:
-        print(f"{w}\t{s:.4f}")
-
-    if top_phr:
-        print("\nTop phrases (bigrams/trigrams):")
-        for p, fr, sc in top_phr:
-            print(f"{p}\t{fr}\tPMI~{sc:.2f}")
-
-    if hashtags:
-        print("\nTop hashtags:")
-        for h, c in sorted(hashtags.items(), key=lambda x: x[1], reverse=True)[:20]:
-            print(f"{h}\t{c}")
-
-    print(f"\nSaved: {out_csv}, {out_phrase_csv}, {out_hashtag_csv}, and {out_txt}")
+    # ---- 趨勢觀察簡報 (Trend Report) ----
+    generate_trend_report(top_keywords, top_phr, hashtags, ckip_results=ckip_results)
+    
+    if debug:
+        print(f"\n[INFO] Analysis complete. Saved: {out_csv}, {out_phrase_csv}, {out_hashtag_csv}, and {out_txt}")
     return top_keywords, top_phr
 
 
@@ -731,6 +998,9 @@ if __name__ == "__main__":
     ap.add_argument("--min-chinese-ratio", type=float, default=0.2, help="min Chinese char ratio per post [0..1]")
     ap.add_argument("--precision", action="store_true",
                     help="stricter filters + binary TF-IDF + nouns only")
+    ap.add_argument("--engine", default="jieba", choices=["jieba", "ckip"], help="NLP engine (default: jieba)")
+    ap.add_argument("--ckip-level", type=int, default=1, choices=[1, 2, 3], help="CKIP model level (1:tiny, 2:base, 3:bert)")
+    ap.add_argument("--device", default="cpu", help="device for CKIP (cpu, cuda, or device index)")
     ap.add_argument("--line-posts", action="store_true", default=None,
                     help="treat each line as a post (auto-detect when omitted)")
     ap.add_argument("--no-dedupe", action="store_true", help="disable near-duplicate removal")
@@ -757,6 +1027,16 @@ if __name__ == "__main__":
     else:
         input_path = args.input
 
+    # Choose device index
+    device_val = -1
+    if args.device == "cuda":
+        device_val = 0
+    elif args.device.isdigit():
+        device_val = int(args.device)
+
+    # Create output directory if needed
+    os.makedirs("outputs", exist_ok=True)
+    
     analyze_file(
         input_path,
         topn=args.top,
@@ -767,10 +1047,10 @@ if __name__ == "__main__":
         top_phrases=args.top_phrases,
         phrase_min_freq=args.phrase_min_freq,
         phrase_pmi_min=args.phrase_pmi_min,
-        out_csv="word_tfidf.csv",
-        out_txt="word_tfidf.txt",
-        out_phrase_csv="phrase_freq.csv",
-        out_hashtag_csv="hashtag_freq.csv",
+        out_csv="outputs/word_tfidf.csv",
+        out_txt="outputs/word_tfidf.txt",
+        out_phrase_csv="outputs/phrase_freq.csv",
+        out_hashtag_csv="outputs/hashtag_freq.csv",
         debug=args.debug,
         user_dict_path=args.user_dict,
         min_doc_tokens=args.min_doc_tokens,
@@ -781,4 +1061,7 @@ if __name__ == "__main__":
         dedupe_hamming=args.dedupe_hamming,
         config_path=config_yaml,
         default_stopwords_path=stopwords_default,
+        engine=args.engine,
+        ckip_level=args.ckip_level,
+        device=device_val,
     )
