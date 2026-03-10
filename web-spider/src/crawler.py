@@ -4,47 +4,56 @@ from tqdm import tqdm
 import os
 import time
 import re
+import json
 
 USERNAME_TOKEN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._]{1,28}[a-z0-9])?$", re.IGNORECASE)
 
-
-JS_EXTRACT_TEXT = """
+# JavaScript to extract post content and interaction counts (Likes, Replies, etc.)
+JS_EXTRACT_POST_DATA = """
 (nodes) => nodes.map(node => {
-  const clone = node.cloneNode(true);
-  clone.querySelectorAll("button, [role='button'], svg, path, time, header, footer").forEach(n => n.remove());
-  return clone.innerText || "";
-})
-"""
+  const getInteractionCount = (container, testId) => {
+    const el = container.querySelector(`[data-testid='${testId}']`);
+    if (!el) return 0;
+    const text = el.innerText.replace(/[^0-9KkMm.]/g, '');
+    if (!text) return 0;
+    let val = parseFloat(text);
+    if (text.toLowerCase().includes('k')) val *= 1000;
+    if (text.toLowerCase().includes('m')) val *= 1000000;
+    return Math.floor(val);
+  };
 
-JS_EXTRACT_POST_TEXT = """
-(nodes) => nodes.map(node => {
+  // Extract main text
   const spans = Array.from(node.querySelectorAll("span[dir='auto']"));
-  const texts = spans.filter(s => {
+  const filteredTexts = spans.filter(s => {
     const t = (s.textContent || "").trim();
     if (!t) return false;
     const a = s.closest("a");
     if (a) {
       const href = a.getAttribute("href") || "";
-      if (href.startsWith("/@")) return false;
+      if (href.startsWith("/@")) return false; 
       if (href.startsWith("/search")) return false;
       if (href.startsWith("/activity")) return false;
-      if (href.startsWith("/following")) return false;
-      if (href.startsWith("/for_you")) return false;
     }
     if (s.closest("time")) return false;
+    if (s.closest("button")) return false;
     return true;
   }).map(s => s.textContent.trim());
-  return texts.join(" ");
+
+  return {
+    text: filteredTexts.join(" "),
+    likes: getInteractionCount(node, 'post-like-button') || 0,
+    replies: getInteractionCount(node, 'post-reply-button') || 0,
+    reposts: getInteractionCount(node, 'post-repost-button') || 0,
+    url: node.querySelector("a[href*='/post/']")?.getAttribute("href") || ""
+  };
 })
 """
 
 class Crawler:
-    def __init__(self, config, login_handler=None, storage=None):
+    def __init__(self, config, storage=None):
         self.config = config
-        self.login_handler = login_handler
         self.storage = storage
         
-        # Compile patterns from config
         self.noise_lines = set(self.config.get("filtering", {}).get("noise_lines", []))
         self.noise_patterns = [
             re.compile(p, re.IGNORECASE) 
@@ -53,238 +62,125 @@ class Crawler:
         
         self.post_selectors = self.config.get("selectors", {}).get("post_priority", [])
         self.post_container = self.config.get("selectors", {}).get("post_container", "div[data-pressable-container='true']")
-        self.strip_selectors = self.config.get("selectors", {}).get("strip", "")
         self.min_block_chars = self.config.get("filtering", {}).get("min_block_chars", 10)
 
-
-
-    def start_crawling(self):
-        if self.login_handler and getattr(self.login_handler, "perform_login", None):
-            if self.login_handler.perform_login():
-                print("Login successful. Starting to crawl...")
-                collected_words = self.collect_words()
-                if self.storage:
-                    self.storage.save_to_file(collected_words)
-            else:
-                print("Login failed. Cannot start crawling.")
-        else:
-            print("No automated login handler provided. Use manual login + crawl_and_collect().")
-
-    def collect_words(self):
-        # fallback/simulated collection when not using Playwright
-        words = ["example", "test", "web", "spider", "example", "data", "collection"]
-        print("Collected words:", words)
-        return words
-
-    def _looks_like_username(self, token):
-        if not token or token.startswith("#"):
-            return False
-        if token.startswith("@"):
-            token = token[1:]
-        if not USERNAME_TOKEN_RE.fullmatch(token):
-            return False
-        return any(ch in token for ch in "._") or any(ch.isdigit() for ch in token)
-
-    def _strip_leading_username(self, line):
-        parts = line.split()
-        if not parts:
-            return ""
-        if self._looks_like_username(parts[0]):
-            return " ".join(parts[1:]).strip()
-        return line
-
     def _needs_login(self, page):
+        """
+        Improved login detection: check URL, title, and presence of login-related elements.
+        """
         try:
+            # Give the page a bit more time for initial load or redirect
+            time.sleep(5)
+            url = page.url.lower()
             title = page.title().lower()
-            if "login" in title or "登入" in title:
+            
+            # 1. URL or Title check
+            if "login" in url or "login" in title or "登入" in title:
                 return True
-        except Exception:
+                
+            # 2. Check for common login button or prompt
+            # Threads login page indicators
+            login_selectors = [
+                "input[name='username']",
+                "input[name='password']",
+                "button:has-text('Log in')",
+                "button:has-text('登入')",
+                "div:has-text('繼續使用 Facebook 登入')",
+                "div:has-text('用 Instagram 登入')",
+            ]
+            
+            for sel in login_selectors:
+                if page.locator(sel).count() > 0:
+                    return True
+
+            # 3. Final check: if we see 0 posts, we are probably on a splash screen or not logged in
+            post_count = page.locator(self.post_container).count()
+            if post_count == 0:
+                return True
+                
+        except Exception as e:
+            # If we error during detection, safer to assume we might need login or just continue
             pass
-        try:
-            if page.locator("input[type='password']").count() > 0:
-                return True
-        except Exception:
-            pass
         return False
 
-    def _wait_for_posts(self, page, timeout_ms=20000):
-        for sel in self.post_selectors:
-            try:
-                page.wait_for_selector(sel, timeout=timeout_ms)
-                return True
-            except Exception:
-                continue
-        return False
-
-    def _is_noise_line(self, line):
-        if re.fullmatch(r"[\W_]+", line):
-            return True
-        line_low = line.strip().lower()
-        if line_low in self.noise_lines:
-            return True
-        for rgx in self.noise_patterns:
-            if rgx.fullmatch(line_low):
-                return True
-        return False
-
-    def _clean_block(self, text):
-        if not text:
-            return ""
+    def _clean_text(self, text):
+        if not text: return ""
         text = text.replace("\u00a0", " ")
         lines = []
         for ln in text.splitlines():
             ln = ln.strip()
-            if not ln:
-                continue
-            if self._is_noise_line(ln):
-                continue
-            ln = self._strip_leading_username(ln)
-            if not ln or self._is_noise_line(ln):
+            if not ln or any(rgx.fullmatch(ln.lower()) for rgx in self.noise_patterns):
                 continue
             lines.append(ln)
-        text = " ".join(lines)
-        text = re.sub(r"\b\d+\s*/\s*\d+\b", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        text = self._strip_leading_username(text)
-        return text
+        return " ".join(lines).strip()
 
-    def _dedupe_key(self, text):
-        return re.sub(r"\s+", " ", text).strip().lower()
-
-    def extract_text_blocks(self, html):
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup.select(self.strip_selectors):
-            tag.decompose()
-        # try common post-like selectors first
-        candidates = []
-        for sel in self.post_selectors:
-            candidates = soup.select(sel)
-            if candidates:
-                break
-        texts = []
-        if candidates:
-            for c in candidates:
-                txt = c.get_text(separator=" ", strip=True)
-                if txt:
-                    texts.append(txt)
-        cleaned = []
-        for t in texts:
-            t = self._clean_block(t)
-            if t and len(t) >= self.min_block_chars:
-                cleaned.append(t)
-        return cleaned
-
-    def extract_text_blocks_from_page(self, page):
-        try:
-            post_blocks = page.locator(self.post_container).evaluate_all(JS_EXTRACT_POST_TEXT)
-        except Exception:
-            post_blocks = []
-        cleaned = []
-        for b in post_blocks:
-            b = self._clean_block(b)
-            if b and len(b) >= self.min_block_chars:
-                cleaned.append(b)
-        if cleaned:
-            return cleaned
-        for sel in self.post_selectors:
-            try:
-                blocks = page.locator(sel).evaluate_all(JS_EXTRACT_TEXT)
-            except Exception:
-                blocks = []
-            cleaned = []
-            for b in blocks:
-                b = self._clean_block(b)
-                if b and len(b) >= self.min_block_chars:
-                    cleaned.append(b)
-            if cleaned:
-                return cleaned
-        return self.extract_text_blocks(page.content())
-
-    def crawl_and_collect(self, start_url="https://www.threads.net/", max_scrolls=200, pause=1.0, user_data_dir="user_data", debug_dir="debug_html"):
+    def crawl_and_collect(self, start_url="https://www.threads.net/", max_scrolls=200, pause=1.5, user_data_dir="user_data", debug_dir="debug_html"):
         """
-        Opens a headful Chromium using the provided user_data_dir (so manual login persists),
-        scrolls the page and collects unique text blocks. Returns a list of collected blocks.
-        This version writes debug HTML files when no blocks are found to help inspection.
+        Synchronous crawling of one URL.
         """
         os.makedirs(debug_dir, exist_ok=True)
         results = []
         seen = set()
+
         try:
             with sync_playwright() as p:
-                ctx = p.chromium.launch_persistent_context(user_data_dir=user_data_dir, headless=False, viewport={"width":1200,"height":900})
+                ctx = p.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir, 
+                    headless=False, 
+                    viewport={"width":1200, "height":900}
+                )
                 page = ctx.new_page()
                 page.goto(start_url)
-                # wait for the feed to load (give it time) and for network to settle
+                
+                # Give it a bit more time for redirects/popups
                 try:
-                    page.wait_for_load_state("networkidle", timeout=15000)
-                except Exception:
-                    time.sleep(2)
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except:
+                    pass
+                
+                # Manual login check
                 if self._needs_login(page):
-                    print("Login required. Please login in the opened browser window.")
-                    input("After logging in, press Enter here to continue...")
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=20000)
-                    except Exception:
-                        time.sleep(2)
+                    print("\n[!] Login required. Please login in the opened browser window.")
+                    print("[*] Waiting for you to finish logging in...")
+                    input(">>> After logging in, press Enter here to continue...")
                     page.goto(start_url)
                     try:
-                        page.wait_for_load_state("networkidle", timeout=15000)
-                    except Exception:
-                        time.sleep(2)
-                self._wait_for_posts(page, timeout_ms=20000)
-
-                # report initial counts of common elements
-                try:
-                    art_count = page.locator("article").count()
-                except Exception:
-                    art_count = None
-                print(f"Initial article count (page.locator('article')) = {art_count}")
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except:
+                        pass
+                
+                print("\n" + "="*50)
+                print("[*] 瀏覽器已就緒！")
+                print("[*] 現在您可以：手動關閉彈窗、確認登入狀態、或是調整頁面內容。")
+                print("[*] 準備好開始抓取後，請回到此視窗按下 Enter 鍵。")
+                print("="*50)
+                input("\n>>> [按 Enter 開始抓取資料]...")
+                print("\n[*] 正在開始捲動與採集，請勿關閉瀏覽器視窗...")
 
                 for i in tqdm(range(max_scrolls), desc="scrolling"):
                     page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    # small pause to let new content render
                     time.sleep(pause)
 
-                    # try waiting briefly for dynamic content
-                    try:
-                        page.wait_for_timeout(200)  # short wait
-                    except Exception:
-                        pass
-
-                    blocks = self.extract_text_blocks_from_page(page)
-
+                    # Extract data
+                    posts = page.locator(self.post_container).evaluate_all(JS_EXTRACT_POST_DATA)
+                    
                     new_count = 0
-                    for b in blocks:
-                        key = self._dedupe_key(b)
+                    for p_data in posts:
+                        p_data['text'] = self._clean_text(p_data['text'])
+                        if len(p_data['text']) < self.min_block_chars:
+                            continue
+                            
+                        key = p_data['text'].strip().lower()
                         if key not in seen:
                             seen.add(key)
-                            results.append(b)
+                            results.append(p_data)
                             new_count += 1
-
-                    if new_count:
-                        print(f"Scroll {i+1}: found {new_count} new blocks (total {len(results)})")
-                    else:
-                        # no new blocks this scroll; save a debug snapshot for inspection
-                        html = page.content()
-                        debug_file = os.path.join(debug_dir, f"snapshot_scroll_{i+1}.html")
-                        with open(debug_file, "w", encoding="utf-8") as fh:
-                            fh.write(html)
-                        # also report counts of likely elements from the live page
-                        try:
-                            a_count = page.locator("article").count()
-                            div_role_article = page.locator("div[role='article']").count()
-                            data_testid = page.locator("[data-testid='post']").count()
-                        except Exception:
-                            a_count = div_role_article = data_testid = "n/a"
-                        try:
-                            page_title = page.title()
-                            page_url = page.url
-                        except Exception:
-                            page_title = page_url = "n/a"
-                        print(f"Scroll {i+1}: no new blocks — saved {debug_file} — counts: article={a_count}, div[role='article']={div_role_article}, [data-testid='post']={data_testid} — title={page_title} url={page_url}")
+                    
+                    if i > 0 and i % 20 == 0:
+                        print(f" Scroll {i}: total {len(results)} posts collected.")
 
                 ctx.close()
         except Exception as e:
-            raise RuntimeError(f"crawler failed: {e}") from e
+            print(f"[!] Crawler error: {e}")
 
         return results

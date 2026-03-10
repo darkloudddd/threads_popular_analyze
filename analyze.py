@@ -6,7 +6,10 @@ import hashlib
 import sys
 import time
 import yaml
+import json
+import json
 from collections import Counter
+from summarize import Summarizer
 
 # --- Optional deps (jieba & pandas) ---
 try:
@@ -530,11 +533,12 @@ def extract_keywords_with_pos(posts, top_n=30, stopwords=None, ignore_tokens=Non
     return sorted_words[:top_n]
 
 
-def generate_trend_report(keywords, phrases, hashtags, ckip_results=None):
+def generate_trend_report(keywords, phrases, hashtags, ckip_results=None, top_posts=None, use_ai=False):
     """
     Generate a categorized summary of trends for the user.
     Safe for Windows terminals (avoiding emoji encoding issues).
     """
+    if top_posts is None: top_posts = []
     header = "\n" + "="*50 + "\nTHREADS 流行趨勢洞察簡報 (Trend Insight Report)\n" + "="*50
     try:
         print(header)
@@ -621,11 +625,24 @@ def generate_trend_report(keywords, phrases, hashtags, ckip_results=None):
 
     if hashtags:
         safe_print("\n[熱門 Hashtags]")
-        tag_list = sorted(hashtags.items(), key=lambda x: x[1], reverse=True)
+        if isinstance(hashtags, dict):
+            tag_list = sorted(hashtags.items(), key=lambda x: x[1], reverse=True)
+        else:
+            tag_list = hashtags # Already a list of (tag, count)
         tags_line = "  " + " ".join([h for h, count in tag_list[:6]])
         safe_print(tags_line)
     
     safe_print("\n" + "="*50)
+    if use_ai:
+        safe_print("\n[AI 智慧洞察摘要]")
+        summarizer = Summarizer()
+        if summarizer.is_available():
+            import asyncio
+            summary = asyncio.run(summarizer.generate_summary(top_posts))
+            safe_print(summary)
+        else:
+            safe_print("提示: 未偵測到 GEMINI_API_KEY，略過 AI 摘要。請在 .env 設定。")
+        safe_print("="*50)
 
 
 def compute_tfidf(all_docs_tokens):
@@ -776,9 +793,9 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
                  out_csv="word_tfidf.csv", out_txt="word_tfidf.txt",
                  out_phrase_csv="phrase_freq.csv", out_hashtag_csv="hashtag_freq.csv",
                  debug=False, user_dict_path=None, min_doc_tokens=3, min_chinese_ratio=0.2,
-                 precision=False, progress=True, dedupe=True, dedupe_hamming=3,
+                 precision=True, use_ai=True, progress=True, dedupe=True, dedupe_hamming=3,
                  config_path=None, default_stopwords_path=None,
-                 engine="jieba", ckip_level=1, device=-1):
+                 engine="ckip", ckip_level=1, device=-1):
     if not os.path.exists(path):
         raise FileNotFoundError(f"input file not found: {path}")
 
@@ -803,148 +820,119 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
     config = load_analysis_config(config_path) if config_path else {}
     
     drop_patterns = config.get("drop_patterns", [])
-    
-    promo_ascii = set(config.get("promo_ascii", []))
-    phrase_drop_regex = config.get("phrase_drop_regex", [])
-    
-    meaningful_ascii = set(config.get("meaningful_ascii_keep", []))
     noisy_ascii = set(config.get("noisy_ascii", []))
     precision_stopwords = set(config.get("precision_stopwords", []))
 
+    # --- DATA LOADING (Structured or Plain) ---
+    posts_data = []
     with open(path, "r", encoding="utf-8") as f:
-        raw = f.read()
+        first_char = f.read(1)
+        f.seek(0)
+        
+        if first_char == "{":
+            # JSONL detected
+            for line in f:
+                if line.strip():
+                    try:
+                        posts_data.append(json.loads(line))
+                    except:
+                        continue
+        else:
+            # Legacy plain text: split by double newline
+            raw_content = f.read()
+            raw_content = clean_text(raw_content)
+            raw_blocks = split_posts(raw_content, drop_patterns=drop_patterns)
+            for b in raw_blocks:
+                posts_data.append({"text": b, "likes": 0, "replies": 0})
 
-    raw = clean_text(raw)
-    posts = split_posts(raw, drop_patterns=drop_patterns)
-    # Strip Threads UI artefacts (time prefix, engagement numbers, etc.)
-    posts = [strip_threads_metadata(p) for p in posts]
-    posts = [p for p in posts if p]
+    if not posts_data:
+        print("No post content found.")
+        return [], []
+
     stopwords = load_stopwords(stopwords_path, default_stopwords_path, noisy_ascii)
-
     if precision:
-        # precision 模式：更嚴格的中文比例、每篇至少 token 數、二值 TF、預設用詞性
-        if not pos_only:
-            pos_only = True
-        min_chinese_ratio = max(min_chinese_ratio, 0.4)
-        min_doc_tokens = max(min_doc_tokens, 5)
-        # 口水詞再擴充
         stopwords |= precision_stopwords
 
-    def chinese_ratio(s: str) -> float:
-        if not s:
-            return 0.0
-        ch = len(re.findall(r"[\u4e00-\u9fff]", s))
-        return ch / max(1, len(s))
+    # Pre-process & Filtering
+    filtered_posts_meta = []
+    for p in posts_data:
+        text = strip_threads_metadata(p['text'])
+        text = normalize_taiwanese_text(text)
+        if not text: continue
+        
+        # Simple quality filter
+        ch_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+        if ch_count / max(1, len(text)) < min_chinese_ratio:
+            continue
+            
+        filtered_posts_meta.append({**p, "clean_text": text})
 
-    filtered_posts = []
-    for p in iter_with_progress(posts, label="filtering", enable=progress):
-        if chinese_ratio(p) >= min_chinese_ratio:
-            filtered_posts.append(p)
+    if not filtered_posts_meta:
+        print("No valid posts after filtering.")
+        return [], []
 
-    if debug:
-        print(f"[DEBUG] posts total: {len(posts)}, after zh-ratio filter: {len(filtered_posts)}")
-        for i, p in enumerate(filtered_posts[:5]):
-            print(f"[DEBUG] sample post {i}: {p[:120].replace('\n',' ')}...")
-
-    docs_tokens = []
-    hashtags = Counter()
-    seen_norm = set()
-    simhash_buckets = {}
-    dup_exact = 0
-    dup_near = 0
-
-    # --- ENGINE-SPECIFIC TOKENIZATION ---
+    # --- TOKENIZATION ---
     ckip_results = None
-    if engine.lower() == "ckip":
-        if not CKIP_OK:
-            print("[WARN] ckip-transformers not installed. Falling back to jieba.")
-        else:
-            analyzer = CKIPAnalyzer(level=ckip_level, device=device)
-            # Batch process filtered posts
-            ckip_results = analyzer.analyze(filtered_posts)
-            
-            # Fill docs_tokens for compatible processing (tfidf, etc.)
-            for i, (ws, pos, ner) in enumerate(ckip_results):
-                toks = []
-                for w, flag in zip(ws, pos):
-                    w = w.strip().lower()
-                    if len(w) >= min_len and w not in stopwords:
-                        toks.append(w)
-                docs_tokens.append(toks)
-                # Hashtag extraction
-                for tag in re.findall(r"#[\w\u4e00-\u9fff]+", filtered_posts[i]):
-                    hashtags[tag.lower()] += 1
+    if engine.lower() == "ckip" and CKIP_OK:
+        analyzer = CKIPAnalyzer(level=ckip_level, device=device)
+        print(f"[*] CKIP Analyzing {len(filtered_posts_meta)} posts...")
+        texts = [p["clean_text"] for p in filtered_posts_meta]
+        ckip_results = analyzer.analyze(texts)
+        
+        for i, (ws, pos, ner) in enumerate(ckip_results):
+            filtered_posts_meta[i]["tokens_pos"] = list(zip(ws, pos))
+    else:
+        # Jieba Tokenization
+        for p in iter_with_progress(filtered_posts_meta, label="tokenizing", enable=progress):
+            words = pseg.cut(p["clean_text"])
+            p["tokens_pos"] = [(w.word, w.flag) for w in words]
 
-    if not ckip_results:
-        # Fallback/Default Jieba behavior
-        for p in iter_with_progress(filtered_posts, label="tokenizing", enable=progress):
-            norm = normalize_text_for_dedupe(p)
-            if norm in seen_norm:
-                dup_exact += 1
+    # --- WEIGHTED SCORING ---
+    keyword_scores = Counter()
+    phrase_scores = Counter()
+    hashtags = Counter()
+
+    for p in filtered_posts_meta:
+        # Calculate interaction weight (Likes/Replies)
+        # Weight = 1 + log10(likes + 1) + log10(replies + 1)*0.5
+        likes = float(p.get("likes", 0))
+        replies = float(p.get("replies", 0))
+        weight = 1.0 + math.log10(likes + 1.0) + (math.log10(replies + 1.0) * 0.5)
+        weight = min(weight, 10.0) # Cap at 10x
+        
+        seen_in_post = set()
+        for word, pos in p.get("tokens_pos", []):
+            word = word.strip().lower()
+            if len(word) < min_len or word in stopwords or word in seen_in_post:
                 continue
-            seen_norm.add(norm)
+            seen_in_post.add(word)
+
+            # POS weight
+            pos_w = 1.0
+            for prefix, w in POS_WEIGHTS.items():
+                if pos.startswith(prefix):
+                    pos_w = w
+                    break
             
-            toks = tokenize_post(p, keep_hash_at=keep_hash_at, pos_only=pos_only, stopwords=stopwords, min_len=min_len)
-            # 額外過濾垃圾
-            toks = [t for t in toks if t not in noisy_ascii and not re.fullmatch(r"[a-z]{2,3}\d*", t)]
-            if keep_hash_at:
-                toks = [t for t in toks if not looks_like_username(t) or t.startswith("@")]
-            else:
-                toks = [t for t in toks if not looks_like_username(t)]
-            
-            if len(toks) >= min_doc_tokens:
-                if dedupe:
-                    sig = simhash(toks)
-                    if is_near_duplicate(sig, simhash_buckets, threshold=dedupe_hamming):
-                        dup_near += 1
-                        continue
-                docs_tokens.append(toks)
-                for tag in re.findall(r"#[\w\u4e00-\u9fff]+", p):
-                    hashtags[tag.lower()] += 1
+            keyword_scores[word] += weight * pos_w
+
+        # Hashtags
+        tags = re.findall(r"#[\w\u4e00-\u9fff]+", p["clean_text"])
+        for tag in tags:
+            hashtags[tag.lower()] += weight * 1.5
+
+        # Phrases
+        phr = extract_phrases([p["clean_text"]], top_n=5) # Local extraction per post
+        for ph_text, f, s in phr:
+            phrase_scores[ph_text] += weight
+
+    # Results
+    top_keywords = keyword_scores.most_common(topn)
+    top_phr = phrase_scores.most_common(top_phrases)
+    top_hashtags = sorted(hashtags.items(), key=lambda x: x[1], reverse=True)[:topn]
 
     if debug:
-        total_tokens = sum(len(t) for t in docs_tokens)
-        non_empty_docs = sum(1 for t in docs_tokens if t)
-        print(f"[DEBUG] non-empty docs: {non_empty_docs}/{len(filtered_posts)}, total tokens: {total_tokens}")
-        if dedupe:
-            print(f"[DEBUG] dedupe exact: {dup_exact}, near: {dup_near}")
-        if non_empty_docs <= 2 or total_tokens < 50:
-            print("[WARN] Very few tokens left. Consider loosening filters or stopwords.")
-
-    # ---- 單詞：TF-IDF 或 Binary TF-IDF ----
-    if docs_tokens:
-        tfidf = compute_tfidf_binary(docs_tokens) if precision else compute_tfidf(docs_tokens)
-        top_words = tfidf.most_common(topn)
-    else:
-        top_words = []
-
-    # 4. Keyword Analysis (TF-IDF with POS filtering)
-    top_keywords = extract_keywords_with_pos(
-        filtered_posts, 
-        top_n=topn, 
-        stopwords=stopwords,
-        ignore_tokens=config.get("ignore_tokens"),
-        pos_filters=list(config.get("pos_filters", [])),
-        ckip_results=ckip_results
-    )
-    
-
-
-    # 5. Phrase Analysis (Bigrams / Trigrams)
-    # We pass the same ignore_tokens to phrase extraction if possible, 
-    # but phrase extraction uses 'cut' internally. 
-    # Ideally we refactor 'extract_phrases' too, but for now let's just use the filtered keywords to guide judgment?
-    # Or just let it run. The 'drop_patterns' in split_posts already removed repetitive lines.
-    top_phr = extract_phrases(
-        posts, 
-        top_n=top_phrases, 
-        stopwords=stopwords,
-        promo_ascii=config.get("promo_ascii", []),
-        drop_regex=config.get("phrase_drop_regex", []),
-        keep_ascii=config.get("meaningful_ascii_keep", set()),
-        ignore_tokens=config.get("ignore_tokens", set()),
-        pos_filters=list(config.get("pos_filters", []))
-    )
+        print(f"[DEBUG] Weighted analysis complete. Top keyword: {top_keywords[0] if top_keywords else 'None'}")
 
     # ---- 儲存結果 ----
     with open(out_txt, "w", encoding="utf-8") as f:
@@ -952,29 +940,32 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
             f.write(f"{w},{s:.4f}\n")
 
     if pd:
-        pd.DataFrame([(w, s) for w, s in top_keywords], columns=["word","tfidf_score"]).to_csv(out_csv, index=False, encoding="utf-8-sig")
+        pd.DataFrame([(w, s) for w, s in top_keywords], columns=["word","weighted_score"]).to_csv(out_csv, index=False, encoding="utf-8-sig")
         if top_phr:
-            pd.DataFrame(top_phr, columns=["phrase","freq","approx_pmi"]).to_csv(out_phrase_csv, index=False, encoding="utf-8-sig")
-        if hashtags:
-            pd.DataFrame(sorted(hashtags.items(), key=lambda x: x[1], reverse=True), columns=["hashtag","count"]).to_csv(out_hashtag_csv, index=False, encoding="utf-8-sig")
+            pd.DataFrame([(p, s) for p, s in top_phr], columns=["phrase","weighted_score"]).to_csv(out_phrase_csv, index=False, encoding="utf-8-sig")
+        if top_hashtags:
+            pd.DataFrame(top_hashtags, columns=["hashtag","weighted_score"]).to_csv(out_hashtag_csv, index=False, encoding="utf-8-sig")
     else:
         with open(out_csv, "w", encoding="utf-8") as f:
-            f.write("word,tfidf_score\n")
+            f.write("word,weighted_score\n")
             for w, s in top_keywords:
                 f.write(f"{w},{s:.4f}\n")
         if top_phr:
             with open(out_phrase_csv, "w", encoding="utf-8") as f:
-                f.write("phrase,freq,approx_pmi\n")
-                for p, fr, sc in top_phr:
-                    f.write(f"{p},{fr},{sc:.4f}\n")
-        if hashtags:
+                f.write("phrase,weighted_score\n")
+                for p, s in top_phr:
+                    f.write(f"{p},{s:.4f}\n")
+        if top_hashtags:
             with open(out_hashtag_csv, "w", encoding="utf-8") as f:
-                f.write("hashtag,count\n")
-                for h, c in sorted(hashtags.items(), key=lambda x: x[1], reverse=True):
-                    f.write(f"{h},{c}\n")
+                f.write("hashtag,weighted_score\n")
+                for h, c in top_hashtags:
+                    f.write(f"{h},{c:.4f}\n")
 
     # ---- 趨勢觀察簡報 (Trend Report) ----
-    generate_trend_report(top_keywords, top_phr, hashtags, ckip_results=ckip_results)
+    # Sort posts by weight for AI summary
+    top_posts_for_ai = sorted(filtered_posts_meta, key=lambda x: x.get('likes', 0) + x.get('replies', 0), reverse=True)[:20]
+    
+    generate_trend_report(top_keywords, top_phr, top_hashtags, ckip_results=ckip_results, top_posts=top_posts_for_ai, use_ai=use_ai)
     
     if debug:
         print(f"\n[INFO] Analysis complete. Saved: {out_csv}, {out_phrase_csv}, {out_hashtag_csv}, and {out_txt}")
@@ -996,9 +987,11 @@ if __name__ == "__main__":
     ap.add_argument("--user-dict", default=None, help="jieba user dict path (optional)")
     ap.add_argument("--min-doc-tokens", type=int, default=3, help="min tokens per post to keep")
     ap.add_argument("--min-chinese-ratio", type=float, default=0.2, help="min Chinese char ratio per post [0..1]")
-    ap.add_argument("--precision", action="store_true",
-                    help="stricter filters + binary TF-IDF + nouns only")
-    ap.add_argument("--engine", default="jieba", choices=["jieba", "ckip"], help="NLP engine (default: jieba)")
+    ap.add_argument("--precision", action="store_false", dest="precision", default=True,
+                    help="關閉精準模式 (預設開啟: 更嚴格過濾 + 名詞優先)")
+    ap.add_argument("--ai", action="store_false", dest="ai", default=True,
+                    help="關閉 Gemini AI 自動摘要 (預設開啟: 需要 .env 內有 API Key)")
+    ap.add_argument("--engine", default="ckip", choices=["jieba", "ckip"], help="NLP 引擎 (預設: ckip)")
     ap.add_argument("--ckip-level", type=int, default=1, choices=[1, 2, 3], help="CKIP model level (1:tiny, 2:base, 3:bert)")
     ap.add_argument("--device", default="cpu", help="device for CKIP (cpu, cuda, or device index)")
     ap.add_argument("--line-posts", action="store_true", default=None,
@@ -1056,6 +1049,7 @@ if __name__ == "__main__":
         min_doc_tokens=args.min_doc_tokens,
         min_chinese_ratio=args.min_chinese_ratio,
         precision=args.precision,
+        use_ai=args.ai,
         progress=not args.no_progress,
         dedupe=not args.no_dedupe,
         dedupe_hamming=args.dedupe_hamming,

@@ -1,61 +1,64 @@
-# Threads 熱門話題分析工具 (v2.0)
+# 🧶 Threads 爆紅趨勢分析工具 v3.1 
 
-## 簡介
-此工具專為個人分析使用設計，包含兩個核心組件：
-1. **爬蟲 (Web Spider)**：使用 Playwright 模擬瀏覽器，支援手動登入以繞過驗證，自動捲動抓取 Threads 貼文。
-2. **分析器 (Analyzer)**：支援 **Jieba** 與 **中研院 CKIP** 雙引擎分析。具備 TF-IDF 權重、SimHash 去重與 NER (實體辨識) 功能，能自動產出分類趨勢報告。
+想知道今天 Threads 上大家都在聊什麼？或是哪位公眾人物又引起話題了嗎？這個工具可以幫您自動抓取貼文、計算熱度，並用 **AI 幫您總結懶人包**！
 
-## 快速開始
+---
 
-### 1. 安裝環境
-確保已安裝 Python 3.10 或以上版本（CKIP 建議 3.10+）。
+## 🚀 三分鐘快速上手
+
+請跟著以下步驟操作：
+
+### 第一步：安裝環境 (只需做一次)
+打開您的終端機 (Terminal/CMD)，輸入：
 ```bash
-# 安裝所有必要與進階requirements
+# 1. 下載必要的套件
 pip install -r requirements.txt
+
+# 2. 安裝瀏覽器驅動（這是爬蟲需要的「動力」）
+playwright install chromium
 ```
 
-### 2. 執行爬蟲
-首次執行需要手動登入：
+### 第二步：設定 AI 助手 (選配功能，建議開啟)
+1. 找到資料夾中的 `.env.example` 檔案，把它改名為 **`.env`**。
+2. 至 [Google AI Studio](https://aistudio.google.com/) 免費申請一串 API Key。
+3. 把變更後的 `.env` 打開，貼上您的 Key：`GEMINI_API_KEY=您的代碼`。
+
+### 第三步：開始抓取資料 (自動爬蟲)
+執行以下指令，程式會自動開啟瀏覽器 (後面數字是 scroll 的次數)：
 ```bash
-python web-spider/src/main.py --user-data "user_data" --output "result.txt" --max-scrolls 200
+python web-spider/src/main.py --max-scrolls 100
 ```
-- **步驟**：登入後回到終端機按下 **Enter** 即可開始自動抓取。
+> **💡 小提醒**：程式開啟後會**先暫停**。您可以手動登入、關閉彈窗，**確認頁面就緒後**，回到終端機畫面按下 **Enter** 鍵即可開始自動採集！
 
-### 3. 執行分析
-抓取完成後（預設讀取 `result.txt`），執行分析腳本：
-
-#### 模式 A：極速分析 (Jieba)
+### 第四步：產生趨勢簡報 (AI 加權分析)
+資料抓完後，輸入這行指令讓 AI 幫您分析：
 ```bash
-python analyze.py --precision
+python analyze.py
 ```
+> **✨ 效果**：程式會**自動啟動 AI 摘要**。它會產出 CSV 報表，並在螢幕上直接印出 **「今日話題懶人包」** 與社群策略建議！
 
-#### 模式 B：高精準分析 (中研院 CKIP)
-具備實體辨識 (NER)，能精準抓出人名、作品與地點。
-```bash
-python analyze.py --engine ckip --ckip-level 1
-```
+---
 
-- **參數說明**：
-    - `--precision`: 開啟精準模式，套用嚴格雜訊過濾並優化詞權重。
-    - `--engine`: 選擇分析引擎 `jieba` (預設) 或 `ckip`。
-    - `--device`: CKIP 可選 `cpu` (預設) 或 `cuda` (GPU 加速)。
-    - `--top`: 設定顯示前 N 個結果（預設 30）。
-    - `--ckip-level`: CKIP 模型等級（1: Tiny 最快, 2: Base 平衡, 3: BERT 最準並含 NER）。
+## 🛠️ 常見指令彙整
 
-## 輸出結果
-分析結果將自動儲存於 **`outputs/`** 資料夾：
-- `outputs/word_tfidf.csv`: 關鍵字權重排行。
-- `outputs/phrase_freq.csv`: 熱門詞組（如：陽光女子合唱團）。
-- `outputs/hashtag_freq.csv`: 熱門 Hashtag 統計。
-- **終端機報告**：自動分類「人物影視、熱門地點、美食生活、事件話題」的趨勢簡報。
+如果您想進行更進階的操作：
 
-## 進階設定
-- `config/stopwords.txt`: **停用詞表**。
-- `config/tw_slang.txt`: **台灣流行語自訂詞庫**。
-- `config/analysis_config.yaml`: **分析器邏輯設定**（包含雜訊 Regex、詞性加權等）。
+| 目標 | 指令 |
+| :--- | :--- |
+| **只想爬某個人的貼文** | `python web-spider/src/main.py --urls "人家的Threads網址"` |
+| **關閉 AI 摘要 (節省 API 額度)** | `python analyze.py --no-ai` |
+| **關閉精準模式 (顯示原始數據)** | `python analyze.py --no-precision` |
+| **切換回極速引擎 (Jieba)** | `python analyze.py --engine jieba` |
+| **顯示更多結果 (預設為30)** | `python analyze.py --top 50` |
 
-## 常見問題
-- **Q: 執行分析時出現 Emoji 編碼錯誤？**
-  - A: 程式已加入編碼保護邏輯。若仍有問題，請確保終端機支援 UTF-8，或確認 python 已更新至最新版。
-- **Q: CKIP 跑很慢？**
-  - A: CKIP 基於深度學習模型（Transformer），處理速度較慢為正常現象。若有 GPU，可加上 `--device cuda` 加速。
+## 📁 產出檔案在哪裡？
+分析完成後，請到 **`outputs/`** 資料夾查看：
+- `word_tfidf.csv`: 最熱門的關鍵字排行榜。
+- `phrase_freq.csv`: 大家的常用詞組。
+- `hashtag_freq.csv`: 最火熱的標籤數量。
+
+## ❓ 常見問題 Q&A
+- **Q: 為什麼 AI 摘要沒出現？**
+  - A: 請確認 `.env` 檔案名稱正確，且 Key 沒有填錯。
+- **Q: 爬蟲卡住了怎麼辦？**
+  - A: 如果畫面長時間沒動，可以按 `Ctrl + C` 強制停止，或是檢查是否需要重新登入。
