@@ -1,6 +1,12 @@
 import os
 import time
 import asyncio
+import warnings
+
+# 隱藏不必要的警告 (如 Google Generative AI 的已過時提示)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*All support for the `google.generativeai` package has ended.*")
+
 import google.generativeai as genai
 from dotenv import load_dotenv
 
@@ -85,8 +91,8 @@ class Summarizer:
         if not self.is_available():
             return "AI Summary unavailable (No API Key)."
 
-        # Prepare prompt
-        p_text = "\n---\n".join([f"Post: {p['text']}\nEngagement: {p.get('likes',0)} likes" for p in top_posts[:15]])
+        # Prepare prompt (Use clean_text to avoid noise like 1/2)
+        p_text = "\n----- \n".join([f"Post: {p.get('clean_text', p['text'])}\nEngagement: {p.get('likes',0)} likes" for p in top_posts[:15]])
         
         prompt = f"""
         你是一位社群趨勢專家。以下是從 Threads 抓取到的熱門貼文：
@@ -94,10 +100,14 @@ class Summarizer:
         
         請根據以上內容，提供以下洞察：
         1. 今日話題懶人包：用 3-5 點總結今天社群在討論什麼。
-        2. 社群氛圍分析：判斷整體社群氛圍（例如：炎上、正向、焦慮、幽默等）。
+        2. 社群氛圍分析：判斷整體社群氛圍。
         3. 策略建議：如果要在這波趨勢中發文，建議什麼主題或方向？
         
-        請用繁體中文回答，口吻要專業中帶點社群語感。
+        【重要規範】：
+        - 請用「繁體中文」回答。
+        - 🚫 禁止使用任何 Markdown 格式（例如：不要用 **粗體**、不要用 ### 標題、不要用 * 列表符號）。
+        - 列表請單純使用數字「1. 」「2. 」開頭。
+        - 內容要極簡、專業、乾淨，適合在手機簡訊中直接閱讀。
         """
 
         return await self._generate_with_retry(prompt)

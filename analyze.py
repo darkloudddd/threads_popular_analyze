@@ -1,3 +1,9 @@
+import warnings
+
+# 隱藏不必要的警告 (如 Google Generative AI 的已過時提示)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*All support for the `google.generativeai` package has ended.*")
+
 import argparse
 import os
 import re
@@ -7,9 +13,11 @@ import sys
 import time
 import yaml
 import json
-import json
 from collections import Counter
 from summarize import Summarizer
+from visualize import run_visualization
+from services.line_notifier import LineNotifier
+import asyncio
 
 # --- Optional deps (jieba & pandas) ---
 try:
@@ -246,16 +254,29 @@ def clean_text(text):
     return text
 
 
+def is_noise(w):
+    """Detect if a string is noise: too short, purely numeric, or purely symbolic."""
+    if not w: return True
+    w = w.strip()
+    if len(w) < 2: return True
+    # Catch pagination (1/2, 5/10)
+    if re.match(r'^\d+/\d+$', w): return True
+    # Catch pure numeric or punctuation
+    if re.match(r'^[0-9./\-: ]+$', w): return True
+    if re.fullmatch(r'[\W_]+', w): return True
+    return False
+
 def strip_threads_metadata(text: str) -> str:
     """
     Remove Threads UI artefacts that get captured by the crawler:
     - Time prefix: '5小時', '23分鐘', '1天', '2天'
     - '第一則串文' prefix
     - Trailing engagement metrics: '1,411 47 13 21', '2.5 萬 211 1,234'
-    - Merged/doubled numbers from dynamic UI: '502503'
+    - Carousel indices: '1/2', '2/5', '10/12' at start or end of lines
     - '劇透' tag spam
     - '翻譯' / 'AI 資訊' suffix
-    - Countdown timer: '還剩N小時'
+    - Product noise: 'UK4', 'US10', '碼' (sizes)
+    - Standalone symbols: '❗️', '‼️', '️‼️'
     """
     # 1. 移除開頭的 '第一則串文'
     text = re.sub(r'^第一則串文\s*', '', text)
@@ -265,11 +286,17 @@ def strip_threads_metadata(text: str) -> str:
     text = re.sub(r'\s*還剩\d+小時\s*$', '', text)
     # 4. 移除末尾的 '翻譯' / 'AI 資訊'
     text = re.sub(r'\s*(翻譯|AI\s*資訊)\s*$', '', text)
-    # 5. 移除尾部的互動數字 (likes, comments, shares, reposts)
-    #    常見格式: '1,411 47 13 21' 或 '2.5 萬 211 1,234 6,381'
-    #    也有合併格式: '502503 16 1 16'
+    # 5. 移除尾部的互動數字
     text = re.sub(r'\s+[\d,.]+(\s*萬)?(?:\s+[\d,.]+(?:\s*萬)?){1,5}\s*$', '', text)
-    # 6. 移除重複的 '劇透' (保留第一個)
+    # 6. 移除常見的 Carousel 頁碼雜訊
+    text = re.sub(r'^\d+/\d+\s+', '', text)
+    text = re.sub(r'\s+\d+/\d+$', '', text)
+    text = re.sub(r'^\d+/\d+$', '', text, flags=re.MULTILINE)
+    # 7. 移除產品規格雜訊 (如 UK4, US10, 24CM)
+    text = re.sub(r'\s*[A-Za-z]{1,3}\d+(\.\d+)?(CM)?\s*', ' ', text)
+    # 8. 移除重複的符號或單獨的驚嘆號雜訊
+    text = re.sub(r'[❗️‼️❕]+', '', text)
+    # 9. 移除重複的 '劇透' (保留第一個)
     text = re.sub(r'(劇透\s*){2,}', '劇透 ', text)
     text = text.strip()
     return text
@@ -536,113 +563,115 @@ def extract_keywords_with_pos(posts, top_n=30, stopwords=None, ignore_tokens=Non
 def generate_trend_report(keywords, phrases, hashtags, ckip_results=None, top_posts=None, use_ai=False):
     """
     Generate a categorized summary of trends for the user.
-    Safe for Windows terminals (avoiding emoji encoding issues).
+    Returns: (full_report_text, ai_summary_only)
     """
+    report_lines = []
+    def rprint(msg):
+        """Helper to both print and collect for return."""
+        try:
+            print(msg)
+        except UnicodeEncodeError:
+            print(msg.encode(sys.stdout.encoding, errors='replace').decode(sys.stdout.encoding))
+        report_lines.append(msg)
+
     if top_posts is None: top_posts = []
-    header = "\n" + "="*50 + "\nTHREADS 流行趨勢洞察簡報 (Trend Insight Report)\n" + "="*50
-    try:
-        print(header)
-    except UnicodeEncodeError:
-        print(header.encode('ascii', errors='replace').decode('ascii'))
+    
+    # 1. Header (Premium Design)
+    rprint("\n" + "✨" + "—"*24 + "✨")
+    rprint(" 🚀 THREADS 流行趨勢洞察 🚀 ")
+    rprint("✨" + "—"*24 + "✨")
 
     # Categories
     people_media = []
     places = []
     food_lifestyle = []
     events_items = []
-    
     # Food/Lifestyle keywords to help categorization
     FOOD_KEYWORDS = {"甜點", "咖啡", "草莓", "蛋糕", "火鍋", "宵夜", "美食", "早午餐", "餐廳", "隱藏"}
     
-    # Process keywords and phrases
     seen = set()
     
-    # 1. Use CKIP NER results if available for high-precision tagging
+    # 1. Use CKIP NER results if available
     if ckip_results:
-        # ner: list of list of NerToken(word, ner, start, end)
         entity_freq = Counter()
         for doc_ws, doc_pos, doc_ner in ckip_results:
             for ent in doc_ner:
                 entity_freq[(ent.word, ent.ner)] += 1
         
-        # Sort entities by frequency
         sorted_entities = sorted(entity_freq.items(), key=lambda x: x[1], reverse=True)
         for (word, etype), count in sorted_entities:
-            if word in seen or len(word) < 2 or word in FOOD_KEYWORDS:
+            if word in seen or is_noise(word) or word in FOOD_KEYWORDS:
                 continue
-            
             if etype in ["PERSON", "WORK_OF_ART"]:
-                people_media.append(f"[NER:{etype}] {word}")
+                people_media.append(word)
                 seen.add(word)
             elif etype in ["GPE", "LOC", "FAC"]:
-                places.append(f"[NER:{etype}] {word}")
+                places.append(word)
                 seen.add(word)
             elif etype in ["PRODUCT", "ORG", "EVENT"]:
-                events_items.append(f"[NER:{etype}] {word}")
+                events_items.append(word)
                 seen.add(word)
 
-    # 2. Process phrases (Bigrams / Trigrams)
-    for item in phrases[:15]: # Take top phrases
+    # 2. Phrases
+    for item in phrases[:15]:
         p = item[0]
-        if p in seen: continue
+        if p in seen or is_noise(p): continue
         if any(f in p for f in FOOD_KEYWORDS):
-            food_lifestyle.append(f"[Food]  {p}")
+            food_lifestyle.append(p)
         elif any(k in p for k in ["演出", "合唱", "電影", "進擊", "巨人", "角色", "演員", "歌手"]):
-            people_media.append(f"[Media] {p}")
+            people_media.append(p)
         else:
-            events_items.append(f"[Event] {p}")
+            events_items.append(p)
         seen.add(p)
 
-    # 3. Process remaining Keywords
+    # 3. Keywords
     for word, score in keywords[:60]:
-        if word in seen: continue
-        # Manual tagging helper (simplified)
+        if word in seen or is_noise(word): continue
         if any(f in word for f in FOOD_KEYWORDS):
-            food_lifestyle.append(f"[Food]  {word}")
+            food_lifestyle.append(word)
         elif any(k in word for k in ["台南", "台北", "日本", "台中", "高雄", "花蓮", "旅遊", "咖啡廳"]):
-            places.append(f"[Place] {word}")
+            places.append(word)
         elif len(word) >= 2:
-            events_items.append(f"[Trend] {word}")
+            events_items.append(word)
 
-    def safe_print(msg):
-        try:
-            print(msg)
-        except UnicodeEncodeError:
-            # Fallback for Windows CP950
-            print(msg.encode(sys.stdout.encoding, errors='replace').decode(sys.stdout.encoding))
-
-    safe_print("\n[人物與影視娛樂]")
-    for item in people_media[:8]: safe_print(f"  - {item}")
+    # --- Print Categorized Sections with Emojis ---
+    if people_media:
+        rprint("\n🎬 【人物與影視娛樂】")
+        rprint("  • " + "、".join(people_media[:10]))
     
-    safe_print("\n[熱門地點與旅遊]")
-    for item in places[:8]: safe_print(f"  - {item}")
+    if places:
+        rprint("\n📍 【熱門地點與旅遊】")
+        rprint("  • " + "、".join(places[:10]))
     
-    safe_print("\n[美食、甜點與生活]")
-    for item in food_lifestyle[:8]: safe_print(f"  - {item}")
+    if food_lifestyle:
+        rprint("\n🍰 【美食、甜點與生活】")
+        rprint("  • " + "、".join(food_lifestyle[:10]))
     
-    safe_print("\n[熱門商品、事件與話題]")
-    for item in events_items[:12]: safe_print(f"  - {item}")
+    if events_items:
+        rprint("\n🔥 【話題趨勢與熱門商品】")
+        rprint("  • " + "、".join(events_items[:15]))
 
     if hashtags:
-        safe_print("\n[熱門 Hashtags]")
-        if isinstance(hashtags, dict):
-            tag_list = sorted(hashtags.items(), key=lambda x: x[1], reverse=True)
-        else:
-            tag_list = hashtags # Already a list of (tag, count)
-        tags_line = "  " + " ".join([h for h, count in tag_list[:6]])
-        safe_print(tags_line)
+        rprint("\n#️⃣ 【熱門 Hashtags】")
+        tag_list = hashtags if isinstance(hashtags, list) else sorted(hashtags.items(), key=lambda x: x[1], reverse=True)
+        rprint("  " + " ".join([h for h, count in tag_list[:8]]))
     
-    safe_print("\n" + "="*50)
+    # --- AI Summary ---
+    summary = None
     if use_ai:
-        safe_print("\n[AI 智慧洞察摘要]")
+        rprint("\n" + "🤖" + "—"*16 + "🤖")
+        rprint(" 🧠 AI 智慧洞察摘要 ")
+        rprint("—"*21)
         summarizer = Summarizer()
         if summarizer.is_available():
             import asyncio
             summary = asyncio.run(summarizer.generate_summary(top_posts))
-            safe_print(summary)
+            rprint(summary)
         else:
-            safe_print("提示: 未偵測到 GEMINI_API_KEY，略過 AI 摘要。請在 .env 設定。")
-        safe_print("="*50)
+            rprint("提示: 未偵測到 GEMINI_API_KEY，略過 AI 摘要。")
+        rprint("—"*32)
+    
+    return "\n".join(report_lines), summary
 
 
 def compute_tfidf(all_docs_tokens):
@@ -790,12 +819,15 @@ def extract_phrases(posts, top_n=15, stopwords=None, promo_ascii=None, drop_rege
 def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
                  keep_hash_at=False, pos_only=False,
                  top_phrases=15, phrase_min_freq=3, phrase_pmi_min=3.0,
-                 out_csv="word_tfidf.csv", out_txt="word_tfidf.txt",
-                 out_phrase_csv="phrase_freq.csv", out_hashtag_csv="hashtag_freq.csv",
-                 debug=False, user_dict_path=None, min_doc_tokens=3, min_chinese_ratio=0.2,
-                 precision=True, use_ai=True, progress=True, dedupe=True, dedupe_hamming=3,
+                 out_csv="outputs/word_tfidf.csv", 
+                 out_txt="outputs/word_tfidf.txt",
+                 out_phrase_csv="outputs/phrase_freq.csv",
+                 out_hashtag_csv="outputs/hashtag_freq.csv",
+                 debug=False, user_dict_path=None, 
+                 min_doc_tokens=1, min_chinese_ratio=0.1,
                  config_path=None, default_stopwords_path=None,
-                 engine="ckip", ckip_level=1, device=-1):
+                 precision=True, use_ai=True, progress=True, dedupe=True, dedupe_hamming=3,
+                 engine="ckip", ckip_level=1, device=-1, use_line=False):
     if not os.path.exists(path):
         raise FileNotFoundError(f"input file not found: {path}")
 
@@ -875,9 +907,10 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
     ckip_results = None
     if engine.lower() == "ckip" and CKIP_OK:
         analyzer = CKIPAnalyzer(level=ckip_level, device=device)
-        print(f"[*] CKIP Analyzing {len(filtered_posts_meta)} posts...")
+        print(f"\n[*] CKIP Analyzing {len(filtered_posts_meta)} posts...")
         texts = [p["clean_text"] for p in filtered_posts_meta]
         ckip_results = analyzer.analyze(texts)
+        print("\n") # 確保進度條後有換行
         
         for i, (ws, pos, ner) in enumerate(ckip_results):
             filtered_posts_meta[i]["tokens_pos"] = list(zip(ws, pos))
@@ -903,7 +936,7 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
         seen_in_post = set()
         for word, pos in p.get("tokens_pos", []):
             word = word.strip().lower()
-            if len(word) < min_len or word in stopwords or word in seen_in_post:
+            if is_noise(word) or word in stopwords or word in seen_in_post:
                 continue
             seen_in_post.add(word)
 
@@ -964,11 +997,33 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
     # ---- 趨勢觀察簡報 (Trend Report) ----
     # Sort posts by weight for AI summary
     top_posts_for_ai = sorted(filtered_posts_meta, key=lambda x: x.get('likes', 0) + x.get('replies', 0), reverse=True)[:20]
-    
-    generate_trend_report(top_keywords, top_phr, top_hashtags, ckip_results=ckip_results, top_posts=top_posts_for_ai, use_ai=use_ai)
-    
+
+    # 產出人類可讀報告
+    full_report, ai_summary = generate_trend_report(top_keywords, top_phr, top_hashtags, ckip_results=ckip_results, top_posts=top_posts_for_ai, use_ai=use_ai)
+
+    # --- v3.2 視覺化與 LINE 通知整合 ---
+    # 1. 執行可視化繪圖
+    print("\n" + "="*40)
+    print("[*] 正在產生趨勢圖表...")
+    try:
+        run_visualization()
+    except Exception as e:
+        print(f"[!] 繪圖失敗: {e}")
+    print("="*40 + "\n")
+
+    # 2. LINE 通知整合
+    if use_line:
+        print("\n[*] 正在發送 LINE 通知...")
+        notifier = LineNotifier()
+        if notifier.is_available():
+            # 直接發送 Terminal 看到的完整報表
+            notifier.send_text(full_report)
+        else:
+            print("[!] LINE 通知未啟動 (缺少 Token 或 ID)")
+
     if debug:
         print(f"\n[INFO] Analysis complete. Saved: {out_csv}, {out_phrase_csv}, {out_hashtag_csv}, and {out_txt}")
+        
     return top_keywords, top_phr
 
 
@@ -999,6 +1054,7 @@ if __name__ == "__main__":
     ap.add_argument("--no-dedupe", action="store_true", help="disable near-duplicate removal")
     ap.add_argument("--dedupe-hamming", type=int, default=3, help="max Hamming distance for simhash dedupe")
     ap.add_argument("--no-progress", action="store_true", help="disable progress bar")
+    ap.add_argument("--line", "-l", action="store_true", help="分析完成後發送 LINE 通知 (需設定環境變數)")
     args = ap.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1058,4 +1114,5 @@ if __name__ == "__main__":
         engine=args.engine,
         ckip_level=args.ckip_level,
         device=device_val,
+        use_line=args.line,
     )
