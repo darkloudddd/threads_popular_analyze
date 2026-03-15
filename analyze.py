@@ -13,6 +13,7 @@ import sys
 import time
 import yaml
 import json
+import string
 from collections import Counter
 from summarize import Summarizer
 from visualize import run_visualization
@@ -70,6 +71,37 @@ def normalize_taiwanese_text(text: str) -> str:
     #    但只在「中文字 空白 中文字」的情境下做替換，避免破壞英文
     text = re.sub(r'(?<=[\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])', '，', text)
     return text
+
+# --- Pre-compiled Regular Expressions for Performance ---
+# For clean_text
+RE_CLEAN_HTTP = re.compile(r"http\S+")
+RE_CLEAN_NON_BMP = re.compile(r"[\U00010000-\U0010ffff]")
+RE_CLEAN_SPACES = re.compile(r"[ \t]+")
+
+# For is_noise
+RE_NOISE_PAGINATION = re.compile(r'^\d+/\d+$')
+RE_NOISE_NUMERIC = re.compile(r'^[0-9./\-: ]+$')
+RE_NOISE_NUMBER_WITH_UNIT = re.compile(r'^\d+(\.\d+)?(萬|千|百|十|%|k|m|l)$', flags=re.IGNORECASE)
+
+# For strip_threads_metadata
+RE_META_FIRST_POST = re.compile(r'^第一則串文\s*')
+RE_META_TIME_PREFIX = re.compile(r'^\d+\s*(小時|分鐘|天)\s*')
+RE_META_TIME_REMAINING = re.compile(r'\s*還剩\d+小時\s*$')
+RE_META_SUFFIX = re.compile(r'\s*(翻譯|AI\s*資訊)\s*$')
+RE_META_ENGAGEMENT = re.compile(r'\s+[\d,.]+(\s*萬)?(?:\s+[\d,.]+(?:\s*萬)?){1,5}\s*$')
+RE_META_CAROUSEL_START = re.compile(r'^\d+/\d+\s+')
+RE_META_CAROUSEL_END = re.compile(r'\s+\d+/\d+$')
+RE_META_CAROUSEL_ALONE = re.compile(r'^\d+/\d+$', flags=re.MULTILINE)
+RE_META_PRODUCT_SIZE = re.compile(r'\s*[A-Za-z]{1,3}\d+(\.\d+)?(CM)?\s*')
+RE_META_SYMBOLS = re.compile(r'[❗️‼️❕]+')
+RE_META_SPOILER = re.compile(r'(劇透\s*)+')
+
+# For split_posts
+RE_SPLIT_DOUBLE_NL = re.compile(r'\n\s*\n')
+RE_SPLIT_REPETITIVE = re.compile(r'((\S{1,4})\s+)\1{2,}')
+
+# For inner loop text filtering
+RE_ALPHANUMERIC = re.compile(r'^[a-zA-Z0-9]+$')
 
 # --------------------------
 # Helpers
@@ -243,26 +275,28 @@ def load_stopwords(custom_path, default_path, noisy_ascii):
 
 
 def clean_text(text):
-    text = re.sub(r"http\S+", " ", text)
+    text = RE_CLEAN_HTTP.sub(" ", text)
     try:
-        text = re.sub(r"[\U00010000-\U0010ffff]", " ", text)
+        text = RE_CLEAN_NON_BMP.sub(" ", text)
     except re.error:
         pass
     # 台灣文本正規化 (注音文轉換 + 空白轉標點)
     text = normalize_taiwanese_text(text)
-    text = re.sub(r"[ \t]+", " ", text)
+    text = RE_CLEAN_SPACES.sub(" ", text)
     return text
 
 
 def is_noise(w):
     """Detect if a string is noise: too short, purely numeric, or purely symbolic."""
     if not w: return True
-    w = w.strip()
+    w = w.strip(string.punctuation + " \t")
     if len(w) < 2: return True
     # Catch pagination (1/2, 5/10)
-    if re.match(r'^\d+/\d+$', w): return True
+    if RE_NOISE_PAGINATION.match(w): return True
     # Catch pure numeric or punctuation
-    if re.match(r'^[0-9./\-: ]+$', w): return True
+    if RE_NOISE_NUMERIC.match(w): return True
+    # Catch pure number with simple unit (e.g. 2萬, 100%, 3k)
+    if RE_NOISE_NUMBER_WITH_UNIT.match(w): return True
     if re.fullmatch(r'[\W_]+', w): return True
     return False
 
@@ -279,25 +313,25 @@ def strip_threads_metadata(text: str) -> str:
     - Standalone symbols: '❗️', '‼️', '️‼️'
     """
     # 1. 移除開頭的 '第一則串文'
-    text = re.sub(r'^第一則串文\s*', '', text)
+    text = RE_META_FIRST_POST.sub('', text)
     # 2. 移除開頭的時間前綴 (5小時, 23分鐘, 1天, 22小時)
-    text = re.sub(r'^\d+\s*(小時|分鐘|天)\s*', '', text)
+    text = RE_META_TIME_PREFIX.sub('', text)
     # 3. 移除末尾 '還剩N小時' 之類的倒計時
-    text = re.sub(r'\s*還剩\d+小時\s*$', '', text)
+    text = RE_META_TIME_REMAINING.sub('', text)
     # 4. 移除末尾的 '翻譯' / 'AI 資訊'
-    text = re.sub(r'\s*(翻譯|AI\s*資訊)\s*$', '', text)
+    text = RE_META_SUFFIX.sub('', text)
     # 5. 移除尾部的互動數字
-    text = re.sub(r'\s+[\d,.]+(\s*萬)?(?:\s+[\d,.]+(?:\s*萬)?){1,5}\s*$', '', text)
+    text = RE_META_ENGAGEMENT.sub('', text)
     # 6. 移除常見的 Carousel 頁碼雜訊
-    text = re.sub(r'^\d+/\d+\s+', '', text)
-    text = re.sub(r'\s+\d+/\d+$', '', text)
-    text = re.sub(r'^\d+/\d+$', '', text, flags=re.MULTILINE)
+    text = RE_META_CAROUSEL_START.sub('', text)
+    text = RE_META_CAROUSEL_END.sub('', text)
+    text = RE_META_CAROUSEL_ALONE.sub('', text)
     # 7. 移除產品規格雜訊 (如 UK4, US10, 24CM)
-    text = re.sub(r'\s*[A-Za-z]{1,3}\d+(\.\d+)?(CM)?\s*', ' ', text)
+    text = RE_META_PRODUCT_SIZE.sub(' ', text)
     # 8. 移除重複的符號或單獨的驚嘆號雜訊
-    text = re.sub(r'[❗️‼️❕]+', '', text)
-    # 9. 移除重複的 '劇透' (保留第一個)
-    text = re.sub(r'(劇透\s*){2,}', '劇透 ', text)
+    text = RE_META_SYMBOLS.sub('', text)
+    # 9. 移除重複的 '劇透' (徹底刪除)
+    text = RE_META_SPOILER.sub('', text)
     text = text.strip()
     return text
 
@@ -309,7 +343,7 @@ def split_posts(text, drop_patterns):
     Filter out entire posts if they match any 'drop_pattern'.
     Also removes repetitive noise lines (like '劇透 劇透...').
     """
-    raw_posts = re.split(r'\n\s*\n', text)
+    raw_posts = RE_SPLIT_DOUBLE_NL.split(text)
     
     # Fallback if double-newline splitting yields too few posts for a large file
     if len(raw_posts) < 10 and len(text) > 2000:
@@ -339,7 +373,7 @@ def split_posts(text, drop_patterns):
             if not line_stripped: continue
             
             # Check for excessive repetition (Word Word Word...)
-            if re.search(r'((\S{1,4})\s+)\1{2,}', line_stripped):
+            if RE_SPLIT_REPETITIVE.search(line_stripped):
                 continue
             cleaned_lines.append(line)
             
@@ -465,6 +499,9 @@ def extract_keywords_with_pos(posts, top_n=30, stopwords=None, ignore_tokens=Non
         ignore_tokens = set()
     if pos_filters is None:
         pos_filters = []  # Empty means no filtering
+    
+    # Convert pos_filters to tuple for fast C-level string prefix matching
+    pos_filters_tuple = tuple(pos_filters) if pos_filters else ()
         
     doc_freq = Counter()
     total_docs = len(posts)
@@ -479,18 +516,12 @@ def extract_keywords_with_pos(posts, top_n=30, stopwords=None, ignore_tokens=Non
                 w = w.strip().lower()
                 if not w or w in stopwords or w in ignore_tokens:
                     continue
-                if len(w) < 2 and not re.match(r'^[a-zA-Z0-9]+$', w):
+                if len(w) < 2 and not RE_ALPHANUMERIC.match(w):
                     continue
                 
                 # CKIP flags are uppercase and more detailed, but we check prefix
-                if pos_filters:
-                    matched_pos = False
-                    f_low = flag.lower()
-                    for pf in pos_filters:
-                        if f_low.startswith(pf):
-                            matched_pos = True
-                            break
-                    if not matched_pos:
+                if pos_filters_tuple:
+                    if not flag.lower().startswith(pos_filters_tuple):
                         continue
                 
                 unique_tokens.add(w)
@@ -508,19 +539,14 @@ def extract_keywords_with_pos(posts, top_n=30, stopwords=None, ignore_tokens=Non
             for w, flag in words:
                 w = w.strip().lower()
                 if len(w) < 2 and w not in ["ai", "ui", "ux"]: 
-                    if not re.match(r'^[a-zA-Z0-9]+$', w): 
+                    if not RE_ALPHANUMERIC.match(w): 
                         continue
 
                 if w in stopwords or w in ignore_tokens:
                     continue
                 
-                if pos_filters:
-                    matched_pos = False
-                    for pf in pos_filters:
-                        if flag.startswith(pf):
-                            matched_pos = True
-                            break
-                    if not matched_pos:
+                if pos_filters_tuple:
+                    if not flag.startswith(pos_filters_tuple):
                         continue
                 
                 unique_tokens.add(w)
@@ -560,7 +586,7 @@ def extract_keywords_with_pos(posts, top_n=30, stopwords=None, ignore_tokens=Non
     return sorted_words[:top_n]
 
 
-def generate_trend_report(keywords, phrases, hashtags, ckip_results=None, top_posts=None, use_ai=False):
+def generate_trend_report(keywords, phrases, hashtags, ckip_results=None, top_posts=None, use_ai=False, stopwords=None):
     """
     Generate a categorized summary of trends for the user.
     Returns: (full_report_text, ai_summary_only)
@@ -581,15 +607,117 @@ def generate_trend_report(keywords, phrases, hashtags, ckip_results=None, top_po
     rprint(" 🚀 THREADS 流行趨勢洞察 🚀 ")
     rprint("✨" + "—"*24 + "✨")
 
-    # Categories
-    people_media = []
-    places = []
-    food_lifestyle = []
-    events_items = []
-    # Food/Lifestyle keywords to help categorization
-    FOOD_KEYWORDS = {"甜點", "咖啡", "草莓", "蛋糕", "火鍋", "宵夜", "美食", "早午餐", "餐廳", "隱藏"}
+    # Categories (8-Tier System)
+    cat_sports = []        # ⚾ 體育與賽事 (Sports)
+    cat_relations = []     # 💔 感情與人際 (Relationships)
+    cat_work = []          # 💼 工作與職場 (Work)
+    cat_tech_finance = []  # 💰 科技與理財 (Tech/Finance)
+    cat_acg = []           # 🎮 動漫與遊戲 (ACG)
+    cat_food = []          # 🍰 美食與生活 (Food/Lifestyle)
+    cat_places = []        # ✈️ 熱門地點與旅遊 (Places/Travel)
+    cat_people = []        # 🎬 人物與影視 (People/Media)
+    cat_others = []        # 🔥 話題趨勢與熱門商品 (Others)
     
+    # Keyword Sets for categorization
+    KW_SPORTS = {"棒球", "經典賽", "wbc", "籃球", "全壘打", "投手", "打者", "球隊", "球員", "比賽", "奧運", "世足", "世大運", "賽事"}
+    KW_RELATIONS = {"男友", "女友", "暈船", "曖昧", "朋友", "渣男", "分手", "脫單", "感情", "戀愛", "結婚", "單身", "交往", "前任"}
+    KW_WORK = {"面試", "老闆", "同事", "加班", "離職", "履歷", "薪水", "工作", "職涯", "公司", "下班", "上班", "主管"}
+    KW_TECH_FIN = {"ai", "股票", "投資", "台積電", "蘋果", "etf", "買房", "理財", "科技", "工程師", "房價", "股市", "app", "ios"}
+    KW_ACG = {"寶可夢", "薩爾達", "展覽", "漫畫", "動畫", "遊戲", "動漫", "任天堂", "switch", "ps5", "二次元", "cosplay", "同人", "神奇寶貝"}
+    KW_FOOD = {"甜點", "咖啡", "草莓", "蛋糕", "火鍋", "宵夜", "美食", "早午餐", "餐廳", "隱藏", "麵包", "好吃"}
+    KW_PLACES = {"台南", "台北", "日本", "台中", "高雄", "花蓮", "旅遊", "咖啡廳", "出國", "行程", "景點", "韓國", "住宿"}
+    KW_PEOPLE = {"演出", "合唱", "電影", "進擊", "巨人", "角色", "演員", "歌手", "導演", "演唱會", "網紅", "藝人"}
+
+    # Auto-inject keywords from tw_slang.txt (single source of truth)
+    SLANG_SECTION_MAP = {
+        "感情": KW_RELATIONS, "人際": KW_RELATIONS,
+        "工作": KW_WORK, "職場": KW_WORK,
+        "美食": KW_FOOD, "生活": KW_FOOD, "通路": KW_FOOD,
+        "科技": KW_TECH_FIN, "3C": KW_TECH_FIN, "財經": KW_TECH_FIN,
+        "追星": KW_PEOPLE, "娛樂": KW_PEOPLE,
+    }
+    slang_path = os.path.join(os.path.dirname(__file__), "config", "tw_slang.txt")
+    if os.path.exists(slang_path):
+        current_kw_set = None
+        with open(slang_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("# ---") and line.endswith("---"):
+                    # Extract section name, match to KW set
+                    current_kw_set = None
+                    for key, kw_set in SLANG_SECTION_MAP.items():
+                        if key in line:
+                            current_kw_set = kw_set
+                            break
+                elif current_kw_set is not None and line and not line.startswith("#"):
+                    parts = line.split()
+                    if parts:
+                        current_kw_set.add(parts[0])
+
+    # Dynamic Overrides from config
+    cat_overrides = {}
+    config_path = os.path.join(os.path.dirname(__file__), "config", "analysis_config.yaml")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+                if cfg and "category_overrides" in cfg:
+                    for cat_name, words in cfg["category_overrides"].items():
+                        if not words: continue
+                        target_list = None
+                        if cat_name == "sports": target_list = cat_sports
+                        elif cat_name == "relations": target_list = cat_relations
+                        elif cat_name == "work": target_list = cat_work
+                        elif cat_name == "tech_finance": target_list = cat_tech_finance
+                        elif cat_name == "acg": target_list = cat_acg
+                        elif cat_name == "food": target_list = cat_food
+                        elif cat_name == "places": target_list = cat_places
+                        elif cat_name == "people": target_list = cat_people
+                        
+                        if target_list is not None:
+                            for w in words:
+                                cat_overrides[w.lower()] = target_list
+        except Exception as e:
+            print(f"[Warning] Failed to load category overrides: {e}")
+
+    def categorize_term(term, etype=None):
+        """Helper to categorize a term based on keyword sets and NER types"""
+        low = term.lower()
+        
+        # 0. Check dynamic overrides first
+        for override_w, target_list in cat_overrides.items():
+            if override_w in low:
+                return target_list
+                
+        # 1. Check strict sports overrides (e.g. "日本隊", "美國隊")
+        if low.endswith("隊") and len(low) >= 2:
+            return cat_sports
+        if any(w in low for w in KW_SPORTS):
+            return cat_sports
+            
+        # 2. Check other domains
+        if any(w in low for w in KW_RELATIONS): return cat_relations
+        if any(w in low for w in KW_WORK): return cat_work
+        if any(w in low for w in KW_TECH_FIN): return cat_tech_finance
+        if any(w in low for w in KW_ACG): return cat_acg
+        if any(w in low for w in KW_FOOD): return cat_food
+        if any(w in low for w in KW_PEOPLE): return cat_people
+        
+        # 3. Check places, but only if it wasn't intercepted as a sports team
+        if any(w in low for w in KW_PLACES): return cat_places
+        
+        # 4. Fallback to NER types if present
+        if etype:
+            if etype in ["PERSON", "WORK_OF_ART"]:
+                return cat_people
+            elif etype in ["GPE", "LOC", "FAC"]:
+                return cat_places
+                
+        # 5. Default
+        return cat_others
+
     seen = set()
+    _sw = stopwords or set()
     
     # 1. Use CKIP NER results if available
     if ckip_results:
@@ -600,56 +728,42 @@ def generate_trend_report(keywords, phrases, hashtags, ckip_results=None, top_po
         
         sorted_entities = sorted(entity_freq.items(), key=lambda x: x[1], reverse=True)
         for (word, etype), count in sorted_entities:
-            if word in seen or is_noise(word) or word in FOOD_KEYWORDS:
-                continue
-            if etype in ["PERSON", "WORK_OF_ART"]:
-                people_media.append(word)
-                seen.add(word)
-            elif etype in ["GPE", "LOC", "FAC"]:
-                places.append(word)
-                seen.add(word)
-            elif etype in ["PRODUCT", "ORG", "EVENT"]:
-                events_items.append(word)
-                seen.add(word)
+            if word in seen or is_noise(word) or word in _sw: continue
+            cat_list = categorize_term(word, etype)
+            cat_list.append(word)
+            seen.add(word)
 
     # 2. Phrases
     for item in phrases[:15]:
         p = item[0]
-        if p in seen or is_noise(p): continue
-        if any(f in p for f in FOOD_KEYWORDS):
-            food_lifestyle.append(p)
-        elif any(k in p for k in ["演出", "合唱", "電影", "進擊", "巨人", "角色", "演員", "歌手"]):
-            people_media.append(p)
-        else:
-            events_items.append(p)
+        if p in seen or is_noise(p) or p in _sw: continue
+        cat_list = categorize_term(p)
+        cat_list.append(p)
         seen.add(p)
 
     # 3. Keywords
     for word, score in keywords[:60]:
-        if word in seen or is_noise(word): continue
-        if any(f in word for f in FOOD_KEYWORDS):
-            food_lifestyle.append(word)
-        elif any(k in word for k in ["台南", "台北", "日本", "台中", "高雄", "花蓮", "旅遊", "咖啡廳"]):
-            places.append(word)
-        elif len(word) >= 2:
-            events_items.append(word)
+        if word in seen or is_noise(word) or word in _sw: continue
+        if len(word) >= 2:
+            cat_list = categorize_term(word)
+            cat_list.append(word)
+            seen.add(word)
 
     # --- Print Categorized Sections with Emojis ---
-    if people_media:
-        rprint("\n🎬 【人物與影視娛樂】")
-        rprint("  • " + "、".join(people_media[:10]))
-    
-    if places:
-        rprint("\n📍 【熱門地點與旅遊】")
-        rprint("  • " + "、".join(places[:10]))
-    
-    if food_lifestyle:
-        rprint("\n🍰 【美食、甜點與生活】")
-        rprint("  • " + "、".join(food_lifestyle[:10]))
-    
-    if events_items:
-        rprint("\n🔥 【話題趨勢與熱門商品】")
-        rprint("  • " + "、".join(events_items[:15]))
+    def print_cat(title, items, limit=12):
+        if items:
+            rprint(f"\n{title}")
+            rprint("  • " + "、".join(items[:limit]))
+            
+    print_cat("⚾ 【體育與賽事】", cat_sports)
+    print_cat("💔 【感情與人際】", cat_relations)
+    print_cat("💼 【工作與職場】", cat_work)
+    print_cat("💰 【科技與理財】", cat_tech_finance)
+    print_cat("🎮 【動漫與遊戲】", cat_acg)
+    print_cat("🍰 【美食與生活】", cat_food)
+    print_cat("✈️ 【熱門地點與旅遊】", cat_places)
+    print_cat("🎬 【人物與影視娛樂】", cat_people)
+    print_cat("🔥 【話題趨勢與熱門商品】", cat_others, limit=15)
 
     if hashtags:
         rprint("\n#️⃣ 【熱門 Hashtags】")
@@ -740,6 +854,8 @@ def extract_phrases(posts, top_n=15, stopwords=None, promo_ascii=None, drop_rege
     if keep_ascii is None: keep_ascii = set()
     if ignore_tokens is None: ignore_tokens = set()
     if pos_filters is None: pos_filters = []
+    
+    pos_filters_tuple = tuple(pos_filters) if pos_filters else ()
 
     unigram = Counter()
     bigram = Counter()
@@ -756,18 +872,13 @@ def extract_phrases(posts, top_n=15, stopwords=None, promo_ascii=None, drop_rege
             if not w: continue
             
             # --- SAME FILTERING LOGIC AS KEYWORDS ---
-            if len(w) < 2 and w not in ["ai", "ui", "ux"] and not re.match(r'^[a-zA-Z0-9]+$', w): 
+            if len(w) < 2 and w not in ["ai", "ui", "ux"] and not RE_ALPHANUMERIC.match(w): 
                 continue
             if w in stopwords or w in ignore_tokens:
                 continue
             
-            if pos_filters:
-                matched_pos = False
-                for pf in pos_filters:
-                    if flag.startswith(pf):
-                        matched_pos = True
-                        break
-                if not matched_pos:
+            if pos_filters_tuple:
+                if not flag.startswith(pos_filters_tuple):
                     continue
             # ----------------------------------------
             
@@ -926,12 +1037,13 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
     hashtags = Counter()
 
     for p in filtered_posts_meta:
-        # Calculate interaction weight (Likes/Replies)
-        # Weight = 1 + log10(likes + 1) + log10(replies + 1)*0.5
+        # Calculate interaction weight (Likes/Replies/Reposts)
+        # Weight = 1 + log10(likes+1) + log10(replies+1)*0.5 + log10(reposts+1)*1.5
         likes = float(p.get("likes", 0))
         replies = float(p.get("replies", 0))
-        weight = 1.0 + math.log10(likes + 1.0) + (math.log10(replies + 1.0) * 0.5)
-        weight = min(weight, 10.0) # Cap at 10x
+        reposts = float(p.get("reposts", 0))
+        weight = 1.0 + math.log10(likes + 1.0) + (math.log10(replies + 1.0) * 0.5) + (math.log10(reposts + 1.0) * 1.5)
+        weight = min(weight, 15.0) # Cap at 15x
         
         seen_in_post = set()
         for word, pos in p.get("tokens_pos", []):
@@ -999,7 +1111,7 @@ def analyze_file(path, topn=30, stopwords_path=None, min_len=2,
     top_posts_for_ai = sorted(filtered_posts_meta, key=lambda x: x.get('likes', 0) + x.get('replies', 0), reverse=True)[:20]
 
     # 產出人類可讀報告
-    full_report, ai_summary = generate_trend_report(top_keywords, top_phr, top_hashtags, ckip_results=ckip_results, top_posts=top_posts_for_ai, use_ai=use_ai)
+    full_report, ai_summary = generate_trend_report(top_keywords, top_phr, top_hashtags, ckip_results=ckip_results, top_posts=top_posts_for_ai, use_ai=use_ai, stopwords=stopwords)
 
     # --- v3.2 視覺化與 LINE 通知整合 ---
     # 1. 執行可視化繪圖

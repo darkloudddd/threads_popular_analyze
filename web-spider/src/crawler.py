@@ -10,43 +10,48 @@ USERNAME_TOKEN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._]{1,28}[a-z0-9])?$", re.IG
 
 # JavaScript to extract post content and interaction counts (Likes, Replies, etc.)
 JS_EXTRACT_POST_DATA = """
-(nodes) => nodes.map(node => {
-  const getInteractionCount = (container, testId) => {
-    const el = container.querySelector(`[data-testid='${testId}']`);
-    if (!el) return 0;
-    const text = el.innerText.replace(/[^0-9KkMm.]/g, '');
-    if (!text) return 0;
-    let val = parseFloat(text);
-    if (text.toLowerCase().includes('k')) val *= 1000;
-    if (text.toLowerCase().includes('m')) val *= 1000000;
-    return Math.floor(val);
-  };
+(nodes) => {
+  const unprocessed = nodes.filter(n => !n.dataset.processed);
+  return unprocessed.map(node => {
+    node.dataset.processed = "true";
+    
+    const getInteractionCount = (container, testId) => {
+      const el = container.querySelector(`[data-testid='${testId}']`);
+      if (!el) return 0;
+      const text = el.innerText.replace(/[^0-9KkMm.]/g, '');
+      if (!text) return 0;
+      let val = parseFloat(text);
+      if (text.toLowerCase().includes('k')) val *= 1000;
+      if (text.toLowerCase().includes('m')) val *= 1000000;
+      return Math.floor(val);
+    };
 
-  // Extract main text
-  const spans = Array.from(node.querySelectorAll("span[dir='auto']"));
-  const filteredTexts = spans.filter(s => {
-    const t = (s.textContent || "").trim();
-    if (!t) return false;
-    const a = s.closest("a");
-    if (a) {
-      const href = a.getAttribute("href") || "";
-      if (href.startsWith("/@")) return false; 
-      if (href.startsWith("/search")) return false;
-      if (href.startsWith("/activity")) return false;
-    }
-    if (s.closest("time")) return false;
-    if (s.closest("button")) return false;
-    return true;
-  }).map(s => s.textContent.trim());
+    // Extract main text
+    const spans = Array.from(node.querySelectorAll("span[dir='auto']"));
+    const filteredTexts = spans.filter(s => {
+      const t = (s.textContent || "").trim();
+      if (!t) return false;
+      const a = s.closest("a");
+      if (a) {
+        const href = a.getAttribute("href") || "";
+        if (href.startsWith("/@")) return false; 
+        if (href.startsWith("/search")) return false;
+        if (href.startsWith("/activity")) return false;
+      }
+      if (s.closest("time")) return false;
+      if (s.closest("button")) return false;
+      return true;
+    }).map(s => s.textContent.trim());
 
-  return {
-    text: filteredTexts.join(" "),
-    likes: getInteractionCount(node, 'post-like-button') || 0,
-    replies: getInteractionCount(node, 'post-reply-button') || 0,
-    reposts: getInteractionCount(node, 'post-repost-button') || 0,
-    url: node.querySelector("a[href*='/post/']")?.getAttribute("href") || ""
-  };
-})
+    return {
+      text: filteredTexts.join(" "),
+      likes: getInteractionCount(node, 'post-like-button') || 0,
+      replies: getInteractionCount(node, 'post-reply-button') || 0,
+      reposts: getInteractionCount(node, 'post-repost-button') || 0,
+      url: node.querySelector("a[href*='/post/']")?.getAttribute("href") || ""
+    };
+  });
+}
 """
 
 class Crawler:
@@ -120,6 +125,7 @@ class Crawler:
         """
         os.makedirs(debug_dir, exist_ok=True)
         results = []
+        uncommitted_batch = []
         seen = set()
 
         try:
@@ -159,7 +165,7 @@ class Crawler:
 
                 for i in tqdm(range(max_scrolls), desc="scrolling"):
                     page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    time.sleep(pause)
+                    page.wait_for_timeout(pause * 1000)
 
                     # Extract data
                     posts = page.locator(self.post_container).evaluate_all(JS_EXTRACT_POST_DATA)
@@ -174,10 +180,20 @@ class Crawler:
                         if key not in seen:
                             seen.add(key)
                             results.append(p_data)
+                            uncommitted_batch.append(p_data)
                             new_count += 1
                     
                     if i > 0 and i % 20 == 0:
                         print(f" Scroll {i}: total {len(results)} posts collected.")
+                        # Progressive save every 20 scrolls
+                        if self.storage and uncommitted_batch:
+                            self.storage.save_results(uncommitted_batch, path="result.jsonl", append=True)
+                            uncommitted_batch = []
+                
+                # Final save for any remaining posts
+                if self.storage and uncommitted_batch:
+                    self.storage.save_results(uncommitted_batch, path="result.jsonl", append=True)
+                    uncommitted_batch = []
 
                 ctx.close()
         except Exception as e:

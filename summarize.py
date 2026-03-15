@@ -65,8 +65,10 @@ class Summarizer:
                                 print(f"[*] Model {model_id} quota 0. Trying next model...")
                                 break
                             
-                            wait_time = (i + 1) * 3
-                            print(f"[*] API Rate Limit (429) hit for {model_id}. Retrying in {wait_time}s... (Attempt {i+1}/{max_retries})")
+                            # Exponential backoff with jitter: (2^i) * 3 + random(0~1)
+                            import random
+                            wait_time = (2 ** i) * 3 + random.uniform(0, 1)
+                            print(f"[*] API Rate Limit (429) hit for {model_id}. Retrying in {wait_time:.1f}s... (Attempt {i+1}/{max_retries})")
                             await asyncio.sleep(wait_time)
                             continue
                         
@@ -92,7 +94,7 @@ class Summarizer:
             return "AI Summary unavailable (No API Key)."
 
         # Prepare prompt (Use clean_text to avoid noise like 1/2)
-        p_text = "\n----- \n".join([f"Post: {p.get('clean_text', p['text'])}\nEngagement: {p.get('likes',0)} likes" for p in top_posts[:15]])
+        p_text = "\n----- \n".join([f"Post: {p.get('clean_text', p['text'])}\nEngagement: {p.get('likes',0)} likes, {p.get('replies', 0)} replies, {p.get('reposts', 0)} reposts" for p in top_posts[:15]])
         
         prompt = f"""
         你是一位社群趨勢專家。以下是從 Threads 抓取到的熱門貼文：
@@ -105,6 +107,7 @@ class Summarizer:
         
         【重要規範】：
         - 請用「繁體中文」回答。
+        - 🚫 主動在此摘要中過濾並忽略「互動誘餌」(例如：求追蹤、純抽獎、按讚看完整版、留言解鎖等)，專注於「實質討論」與「社群共鳴」的話題。
         - 🚫 禁止使用任何 Markdown 格式（例如：不要用 **粗體**、不要用 ### 標題、不要用 * 列表符號）。
         - 列表請單純使用數字「1. 」「2. 」開頭。
         - 內容要極簡、專業、乾淨，適合在手機簡訊中直接閱讀。
