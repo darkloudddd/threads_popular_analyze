@@ -59,6 +59,30 @@ def generate_wordcloud(freq_dict, title, output_path, font_path=None):
     plt.close()
     print(f"[+] 詞雲圖已儲存至: {output_path}")
 
+# --- 4. 繪製分類趨勢圖 ---
+def plot_categorized_trends(cat_data, output_path):
+    """Draw a horizontal bar chart showing word counts per category."""
+    categories = []
+    counts = []
+    
+    for cat, items in cat_data.items():
+        if items:
+            categories.append(cat)
+            counts.append(len(items))
+            
+    if not categories:
+        return
+
+    plt.figure(figsize=(10, 6))
+    sns.barplot(x=counts, y=categories, palette="magma")
+    plt.title('各項板塊話題熱度分布', fontsize=16, pad=20)
+    plt.xlabel('熱門詞彙數量', fontsize=12)
+    plt.ylabel('趨勢分類', fontsize=12)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"[+] 分類趨勢圖已儲存至: {output_path}")
+
 # --- 主程式 ---
 def run_visualization():
     setup_chinese_font()
@@ -67,6 +91,17 @@ def run_visualization():
     visuals_dir = os.path.join(output_dir, "visuals")
     os.makedirs(visuals_dir, exist_ok=True)
     
+    # 優先處理分類數據 (Architecture Realignment)
+    import json
+    cat_file = os.path.join(output_dir, "categorized_trends.json")
+    if os.path.exists(cat_file):
+        try:
+            with open(cat_file, "r", encoding="utf-8") as f:
+                cat_data = json.load(f)
+                plot_categorized_trends(cat_data, os.path.join(visuals_dir, "category_distribution.png"))
+        except Exception as e:
+            print(f"[!] 無法讀取分類 JSON: {e}")
+
     # --- 關鍵字分析 ---
     word_file = os.path.join(output_dir, "word_tfidf.csv")
     if os.path.exists(word_file):
@@ -78,7 +113,8 @@ def run_visualization():
             
             # 詞雲圖
             # 獲取字型路徑供 WordCloud 使用
-            font_prop = fm.FontProperties(family=plt.rcParams['font.sans-serif'][0])
+            current_font = plt.rcParams['font.sans-serif'][0]
+            font_prop = fm.FontProperties(family=current_font)
             font_path = fm.findfont(font_prop)
             
             # 轉字典

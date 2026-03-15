@@ -1,8 +1,0 @@
-beautifulsoup4
-lxml
-pandas
-playwright
-python-dotenv
-requests
-tqdm
-PyYAML

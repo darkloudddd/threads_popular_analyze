@@ -9,27 +9,26 @@
 ```mermaid
 flowchart LR
     subgraph 資料抓取
-        A["crawler.py"] -->|Playwright 自動滾動| B["result.txt"]
+        A["crawler.py"] -->|Playwright| B["result.txt"]
     end
 
-    subgraph NLP 分析引擎
-        B --> C["文本清洗"]
-        C --> D["CKIP / Jieba 斷詞與 NER"]
+    subgraph NLP 分析引擎 (analyze.py)
+        B --> C["nlp_utils.py<br/>(文本清洗 / 雜訊處理)"]
+        C --> D["CKIP / Jieba<br/>(斷詞與 NER)"]
         D --> E["TF-IDF 權重計算"]
     end
 
     subgraph 分類與產出
         E --> F["8 大語境分類器"]
-        F --> G["visualize.py 圖表與詞雲"]
-        F --> H["summarize.py Gemini AI 摘要"]
+        F -->|categorized_trends.json| G["visualize.py<br/>(趨勢分佈圖)"]
+        F -->|Thematic Context| H["summarize.py<br/>(Gemini AI 摘要)"]
         G --> I["LINE 推播通知"]
         H --> I
     end
 
-    subgraph 設定檔
-        J["analysis_config.yaml"] -.->|動態分類覆寫| F
+    subgraph 設定檔 (config/)
+        J["analysis_config.yaml"] -.->|精準過濾與分類| F
         K["tw_slang.txt"] -.->|流行語注入| D
-        K -.->|關鍵字同步| F
         L["stopwords.txt"] -.->|雜訊過濾| C
     end
 ```
@@ -67,7 +66,7 @@ LINE_USER_ID=<your_id>
 ### 3. 資料抓取
 
 ```bash
-python web-spider/src/crawler.py
+python web-spider/src/main.py
 ```
 
 啟動後會開啟瀏覽器，請手動登入 Threads。登入完成後回到終端機按 Enter，爬蟲將自動滾動並抓取貼文。抓取結果會儲存至 `result.txt`。

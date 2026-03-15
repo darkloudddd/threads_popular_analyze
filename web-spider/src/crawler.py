@@ -200,3 +200,7 @@ class Crawler:
             print(f"[!] Crawler error: {e}")
 
         return results
+
+if __name__ == "__main__":
+    from main import main
+    main()

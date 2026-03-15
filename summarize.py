@@ -86,7 +86,7 @@ class Summarizer:
         
         return f"Error: All Gemini models failed or Quota exceeded. Details: {last_error}"
 
-    async def generate_summary(self, top_posts):
+    async def generate_summary(self, top_posts, categorized_data=None):
         """
         Generates a summary of the top trending posts.
         """
@@ -96,9 +96,19 @@ class Summarizer:
         # Prepare prompt (Use clean_text to avoid noise like 1/2)
         p_text = "\n----- \n".join([f"Post: {p.get('clean_text', p['text'])}\nEngagement: {p.get('likes',0)} likes, {p.get('replies', 0)} replies, {p.get('reposts', 0)} reposts" for p in top_posts[:15]])
         
+        cat_context = ""
+        if categorized_data:
+            cat_lines = []
+            for cat, items in categorized_data.items():
+                if items:
+                    cat_lines.append(f"- {cat}: {', '.join(items[:8])}")
+            if cat_lines:
+                cat_context = "\n【已知今日趨勢分類與關鍵字】：\n" + "\n".join(cat_lines)
+
         prompt = f"""
         你是一位社群趨勢專家。以下是從 Threads 抓取到的熱門貼文：
         {p_text}
+        {cat_context}
         
         請根據以上內容，提供以下洞察：
         1. 今日話題懶人包：用 3-5 點總結今天社群在討論什麼。
@@ -107,6 +117,7 @@ class Summarizer:
         
         【重要規範】：
         - 請用「繁體中文」回答。
+        - 💡 摘要內容必須與「已知今日趨勢分類」保持一致，不要各說各話。
         - 🚫 主動在此摘要中過濾並忽略「互動誘餌」(例如：求追蹤、純抽獎、按讚看完整版、留言解鎖等)，專注於「實質討論」與「社群共鳴」的話題。
         - 🚫 禁止使用任何 Markdown 格式（例如：不要用 **粗體**、不要用 ### 標題、不要用 * 列表符號）。
         - 列表請單純使用數字「1. 」「2. 」開頭。

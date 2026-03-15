@@ -19,6 +19,12 @@ from summarize import Summarizer
 from visualize import run_visualization
 from services.line_notifier import LineNotifier
 import asyncio
+from services.nlp_utils import (
+    clean_text, is_noise, strip_threads_metadata, normalize_text_for_dedupe,
+    looks_like_username, normalize_taiwanese_text, load_stopwords,
+    POS_WEIGHTS, POS_KEEP_PREFIX,
+    RE_ALPHANUMERIC, RE_SPLIT_DOUBLE_NL, RE_SPLIT_REPETITIVE
+)
 
 # --- Optional deps (jieba & pandas) ---
 try:
@@ -43,65 +49,6 @@ try:
 except Exception:
     CKIP_OK = False
 
-# POS 保留：名詞/專有名詞/地名/機構名/動名詞等
-POS_KEEP_PREFIX = ("n", "nr", "ns", "nt", "nz", "vn")
-# POS 加權：專有名詞、地名、機構名加權，提升趨勢感
-POS_WEIGHTS = {
-    "nz": 1.5,  # 其他專名
-    "nt": 1.5,  # 機構名
-    "ns": 1.3,  # 地名
-    "nr": 1.2,  # 人名
-}
-
-USERNAME_TOKEN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._]{1,28}[a-z0-9])?$", re.IGNORECASE)
-
-# --- 注音文 / 台灣口語轉換表 ---
-ZHUYIN_MAP = {
-    "ㄉ": "的", "ㄅ": "吧", "ㄇ": "嗎", "ㄋ": "呢",
-    "ㄌ": "了", "ㄛ": "喔", "ㄟ": "欸", "ㄏ": "呵",
-    "ㄆ": "噗", "ㄎ": "可",
-}
-_ZHUYIN_RE = re.compile("(" + "|".join(re.escape(k) for k in ZHUYIN_MAP) + ")")
-
-def normalize_taiwanese_text(text: str) -> str:
-    """Convert common zhuyin abbreviations and normalize spaces as punctuation."""
-    # 1. 注音文轉換 (ㄉ -> 的, ㄅ -> 吧, ...)
-    text = _ZHUYIN_RE.sub(lambda m: ZHUYIN_MAP[m.group()], text)
-    # 2. 台灣用戶常以空白取代標點 — 將連續空白轉為全形逗號幫助 jieba 斷句
-    #    但只在「中文字 空白 中文字」的情境下做替換，避免破壞英文
-    text = re.sub(r'(?<=[\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])', '，', text)
-    return text
-
-# --- Pre-compiled Regular Expressions for Performance ---
-# For clean_text
-RE_CLEAN_HTTP = re.compile(r"http\S+")
-RE_CLEAN_NON_BMP = re.compile(r"[\U00010000-\U0010ffff]")
-RE_CLEAN_SPACES = re.compile(r"[ \t]+")
-
-# For is_noise
-RE_NOISE_PAGINATION = re.compile(r'^\d+/\d+$')
-RE_NOISE_NUMERIC = re.compile(r'^[0-9./\-: ]+$')
-RE_NOISE_NUMBER_WITH_UNIT = re.compile(r'^\d+(\.\d+)?(萬|千|百|十|%|k|m|l)$', flags=re.IGNORECASE)
-
-# For strip_threads_metadata
-RE_META_FIRST_POST = re.compile(r'^第一則串文\s*')
-RE_META_TIME_PREFIX = re.compile(r'^\d+\s*(小時|分鐘|天)\s*')
-RE_META_TIME_REMAINING = re.compile(r'\s*還剩\d+小時\s*$')
-RE_META_SUFFIX = re.compile(r'\s*(翻譯|AI\s*資訊)\s*$')
-RE_META_ENGAGEMENT = re.compile(r'\s+[\d,.]+(\s*萬)?(?:\s+[\d,.]+(?:\s*萬)?){1,5}\s*$')
-RE_META_CAROUSEL_START = re.compile(r'^\d+/\d+\s+')
-RE_META_CAROUSEL_END = re.compile(r'\s+\d+/\d+$')
-RE_META_CAROUSEL_ALONE = re.compile(r'^\d+/\d+$', flags=re.MULTILINE)
-RE_META_PRODUCT_SIZE = re.compile(r'\s*[A-Za-z]{1,3}\d+(\.\d+)?(CM)?\s*')
-RE_META_SYMBOLS = re.compile(r'[❗️‼️❕]+')
-RE_META_SPOILER = re.compile(r'(劇透\s*)+')
-
-# For split_posts
-RE_SPLIT_DOUBLE_NL = re.compile(r'\n\s*\n')
-RE_SPLIT_REPETITIVE = re.compile(r'((\S{1,4})\s+)\1{2,}')
-
-# For inner loop text filtering
-RE_ALPHANUMERIC = re.compile(r'^[a-zA-Z0-9]+$')
 
 # --------------------------
 # Helpers
@@ -235,105 +182,7 @@ def iter_with_progress(items, label="processing", enable=True):
     sys.stderr.flush()
 
 
-def looks_like_username(token: str) -> bool:
-    if not token:
-        return False
-    if token.startswith("#"):
-        return False
-    if token.startswith("@"):
-        token = token[1:]
-    if not USERNAME_TOKEN_RE.fullmatch(token):
-        return False
-    return "." in token or "_" in token
 
-
-def normalize_text_for_dedupe(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-
-def load_stopwords(custom_path, default_path, noisy_ascii):
-    s = set()
-    # Load default stopwords
-    if default_path and os.path.exists(default_path):
-        with open(default_path, "r", encoding="utf-8") as f:
-            for line in f:
-                w = line.strip()
-                if w:
-                    s.add(w)
-    
-    # Load custom stopwords
-    if custom_path and os.path.exists(custom_path):
-        with open(custom_path, "r", encoding="utf-8") as f:
-            for line in f:
-                w = line.strip()
-                if w:
-                    s.add(w)
-                    
-    if noisy_ascii:
-        s |= noisy_ascii
-    return s
-
-
-def clean_text(text):
-    text = RE_CLEAN_HTTP.sub(" ", text)
-    try:
-        text = RE_CLEAN_NON_BMP.sub(" ", text)
-    except re.error:
-        pass
-    # 台灣文本正規化 (注音文轉換 + 空白轉標點)
-    text = normalize_taiwanese_text(text)
-    text = RE_CLEAN_SPACES.sub(" ", text)
-    return text
-
-
-def is_noise(w):
-    """Detect if a string is noise: too short, purely numeric, or purely symbolic."""
-    if not w: return True
-    w = w.strip(string.punctuation + " \t")
-    if len(w) < 2: return True
-    # Catch pagination (1/2, 5/10)
-    if RE_NOISE_PAGINATION.match(w): return True
-    # Catch pure numeric or punctuation
-    if RE_NOISE_NUMERIC.match(w): return True
-    # Catch pure number with simple unit (e.g. 2萬, 100%, 3k)
-    if RE_NOISE_NUMBER_WITH_UNIT.match(w): return True
-    if re.fullmatch(r'[\W_]+', w): return True
-    return False
-
-def strip_threads_metadata(text: str) -> str:
-    """
-    Remove Threads UI artefacts that get captured by the crawler:
-    - Time prefix: '5小時', '23分鐘', '1天', '2天'
-    - '第一則串文' prefix
-    - Trailing engagement metrics: '1,411 47 13 21', '2.5 萬 211 1,234'
-    - Carousel indices: '1/2', '2/5', '10/12' at start or end of lines
-    - '劇透' tag spam
-    - '翻譯' / 'AI 資訊' suffix
-    - Product noise: 'UK4', 'US10', '碼' (sizes)
-    - Standalone symbols: '❗️', '‼️', '️‼️'
-    """
-    # 1. 移除開頭的 '第一則串文'
-    text = RE_META_FIRST_POST.sub('', text)
-    # 2. 移除開頭的時間前綴 (5小時, 23分鐘, 1天, 22小時)
-    text = RE_META_TIME_PREFIX.sub('', text)
-    # 3. 移除末尾 '還剩N小時' 之類的倒計時
-    text = RE_META_TIME_REMAINING.sub('', text)
-    # 4. 移除末尾的 '翻譯' / 'AI 資訊'
-    text = RE_META_SUFFIX.sub('', text)
-    # 5. 移除尾部的互動數字
-    text = RE_META_ENGAGEMENT.sub('', text)
-    # 6. 移除常見的 Carousel 頁碼雜訊
-    text = RE_META_CAROUSEL_START.sub('', text)
-    text = RE_META_CAROUSEL_END.sub('', text)
-    text = RE_META_CAROUSEL_ALONE.sub('', text)
-    # 7. 移除產品規格雜訊 (如 UK4, US10, 24CM)
-    text = RE_META_PRODUCT_SIZE.sub(' ', text)
-    # 8. 移除重複的符號或單獨的驚嘆號雜訊
-    text = RE_META_SYMBOLS.sub('', text)
-    # 9. 移除重複的 '劇透' (徹底刪除)
-    text = RE_META_SPOILER.sub('', text)
-    text = text.strip()
-    return text
 
 
 def split_posts(text, drop_patterns):
@@ -765,6 +614,25 @@ def generate_trend_report(keywords, phrases, hashtags, ckip_results=None, top_po
     print_cat("🎬 【人物與影視娛樂】", cat_people)
     print_cat("🔥 【話題趨勢與熱門商品】", cat_others, limit=15)
 
+    # Structure data for AI and Visualization
+    categorized_data = {
+        "體育賽事": cat_sports,
+        "感情人際": cat_relations,
+        "工作職場": cat_work,
+        "科技理財": cat_tech_finance,
+        "動漫遊戲": cat_acg,
+        "美食生活": cat_food,
+        "熱門旅遊": cat_places,
+        "影視娛樂": cat_people,
+        "話題趨勢": cat_others
+    }
+    
+    # Save structured data for visualize.py (Architecture Realignment Point 2)
+    output_dir = os.path.dirname(config_path).replace("config", "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "categorized_trends.json"), "w", encoding="utf-8") as f:
+        json.dump(categorized_data, f, ensure_ascii=False, indent=2)
+
     if hashtags:
         rprint("\n#️⃣ 【熱門 Hashtags】")
         tag_list = hashtags if isinstance(hashtags, list) else sorted(hashtags.items(), key=lambda x: x[1], reverse=True)
@@ -779,8 +647,9 @@ def generate_trend_report(keywords, phrases, hashtags, ckip_results=None, top_po
         summarizer = Summarizer()
         if summarizer.is_available():
             import asyncio
-            summary = asyncio.run(summarizer.generate_summary(top_posts))
+            summary = asyncio.run(summarizer.generate_summary(top_posts, categorized_data=categorized_data))
             rprint(summary)
+            rprint("—"*21)
         else:
             rprint("提示: 未偵測到 GEMINI_API_KEY，略過 AI 摘要。")
         rprint("—"*32)
