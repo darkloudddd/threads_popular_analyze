@@ -12,7 +12,7 @@ flowchart LR
         A["crawler.py"] -->|Playwright| B["result.txt"]
     end
 
-    subgraph NLP 分析引擎 (analyze.py)
+    subgraph "NLP 分析引擎 (analyze.py)"
         B --> C["nlp_utils.py<br/>(文本清洗 / 雜訊處理)"]
         C --> D["CKIP / Jieba<br/>(斷詞與 NER)"]
         D --> E["TF-IDF 權重計算"]
@@ -26,7 +26,7 @@ flowchart LR
         H --> I
     end
 
-    subgraph 設定檔 (config/)
+    subgraph "設定檔 (config/)"
         J["analysis_config.yaml"] -.->|精準過濾與分類| F
         K["tw_slang.txt"] -.->|流行語注入| D
         L["stopwords.txt"] -.->|雜訊過濾| C
